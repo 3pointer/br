@@ -429,7 +429,7 @@ func (bc *Client) BackupRange(
 	})
 
 	// Check if there are duplicated files.
-	checkDupFiles(&results)
+	rtree.CheckDupFiles(&results)
 
 	return nil
 }
@@ -473,7 +473,7 @@ func (bc *Client) fineGrainedBackup(
 	bo := tikv.NewBackoffer(ctx, backupFineGrainedMaxBackoff)
 	for {
 		// Step1, check whether there is any incomplete range
-		incomplete := getIncompleteRange(&rangeTree, startKey, endKey)
+		incomplete := rangeTree.GetIncompleteRange(startKey, endKey)
 		if len(incomplete) == 0 {
 			return nil
 		}
