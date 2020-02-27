@@ -3,6 +3,7 @@ package restore
 import (
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"math"
 	"sort"
@@ -42,7 +43,7 @@ type Client struct {
 	pdClient     pd.Client
 	fileImporter FileImporter
 	workerPool   *utils.WorkerPool
-	tlsConf         *tls.Config
+	tlsConf      *tls.Config
 
 	databases       map[string]*utils.Database
 	ddlJobs         []*model.Job
@@ -73,7 +74,7 @@ func NewRestoreClient(
 		cancel:   cancel,
 		pdClient: pdClient,
 		db:       db,
-		tlsConf:         tlsConf,
+		tlsConf:  tlsConf,
 	}, nil
 }
 
@@ -272,12 +273,15 @@ func (rc *Client) RestoreFiles(
 	start := time.Now()
 	defer func() {
 		elapsed := time.Since(start)
-		if err == nil {
-			log.Info("Restore Files",
-				zap.Int("files", len(files)), zap.Duration("take", elapsed))
-			summary.CollectSuccessUnit("files", elapsed)
-		} else {
-			summary.CollectFailureUnit("files", err)
+		if len(files) > 0 {
+			key := hex.EncodeToString(files[0].Sha256)
+			if err == nil {
+				log.Info("Restore Files",
+					zap.Int("files", len(files)), zap.Duration("take", elapsed))
+				summary.CollectSuccessUnit(key, elapsed)
+			} else {
+				summary.CollectFailureUnit(key, err)
+			}
 		}
 	}()
 

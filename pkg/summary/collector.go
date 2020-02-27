@@ -132,10 +132,10 @@ func (tc *logCollector) Summary(name string) {
 			msg += ", failed ranges"
 		}
 	case RestoreUnit:
-		msg = fmt.Sprintf("total restore tables: %d, total success: %d, total failed: %d",
+		msg = fmt.Sprintf("total restore operations (split region + restore files): %d, total success: %d, total failed: %d",
 			tc.unitCount, len(tc.successCosts), len(tc.failureReasons))
 		if len(tc.failureReasons) != 0 {
-			msg += ", failed tables"
+			msg += ", failed operations"
 		}
 	}
 

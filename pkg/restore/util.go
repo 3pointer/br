@@ -316,7 +316,7 @@ func SplitRanges(
 	start := time.Now()
 	defer func() {
 		elapsed := time.Since(start)
-		summary.CollectDuration("split region", elapsed)
+		summary.CollectSuccessUnit("split region", elapsed)
 	}()
 	splitter := NewRegionSplitter(NewSplitClient(client.GetPDClient(), client.GetTLSConfig()))
 	return splitter.Split(ctx, ranges, rewriteRules, func(keys [][]byte) {
