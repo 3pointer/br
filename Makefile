@@ -18,7 +18,7 @@ release:
 	GO111MODULE=on go build -ldflags '$(LDFLAGS)' -o bin/br
 
 build:
-	GO111MODULE=on go build -ldflags '$(LDFLAGS)' -race -o bin/br
+	GO111MODULE=on go build -ldflags '$(LDFLAGS)' -o bin/br
 
 build_for_integration_test:
 	GO111MODULE=on go test -c -cover -covermode=count \
