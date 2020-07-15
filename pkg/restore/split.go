@@ -269,8 +269,20 @@ func getSplitKeys(rewriteRules *RewriteRules, ranges []rtree.Range, regions []*R
 	for _, rule := range rewriteRules.Data {
 		checkKeys = append(checkKeys, rule.GetNewKeyPrefix())
 	}
+	curSize := 0
+	lastEndKey := []byte{}
 	for _, rg := range ranges {
-		checkKeys = append(checkKeys, truncateRowKey(rg.EndKey))
+		curSize += rg.ApproximateSize
+		_, indexID, isRecord, _ := tablecodec.DecodeKeyHead(rg.EndKey)
+		_, LastIndexID, isLastRecord, _ := tablecodec.DecodeKeyHead(lastEndKey)
+		if curSize > (96<<20) ||
+			lastEndKey == nil ||
+			(isLastRecord && !isRecord) ||
+			(indexID > 0 && indexID != LastIndexID) {
+			checkKeys = append(checkKeys, truncateRowKey(rg.EndKey))
+			curSize = 0
+		}
+		lastEndKey = rg.EndKey
 	}
 	for _, key := range checkKeys {
 		if region := NeedSplit(key, regions); region != nil {
