@@ -93,10 +93,15 @@ func (rs *RegionSplitter) Split(
 			maxKey = rule.GetNewKeyPrefix()
 		}
 	}
-	interval := SplitRetryInterval
-	scatterRegions := make([]*RegionInfo, 0)
 SplitRegions:
+	var scatterRegions []*RegionInfo
+	var retry bool
 	for i := 0; i < SplitRetryTimes; i++ {
+		if i > 3 {
+			log.Warn("splitting regions failed, retry it", zap.Error(errSplit))
+		}
+		var newRegions []*RegionInfo
+		scatterRegions = make([]*RegionInfo, 0)
 		regions, errScan := PaginateScanRegion(ctx, rs.client, minKey, maxKey, scanRegionPaginationLimit)
 		if errScan != nil {
 			return errors.Trace(errScan)
@@ -105,39 +110,28 @@ SplitRegions:
 			log.Warn("cannot scan any region")
 			return nil
 		}
-		splitKeyMap := getSplitKeys(rewriteRules, sortedRanges, regions)
+		splitAndScatterKeyMap := getSplitAndScatterKeys(rewriteRules, regions)
+		splitKeyMap := getSplitKeys(sortedRanges, regions)
 		regionMap := make(map[uint64]*RegionInfo)
 		for _, region := range regions {
 			regionMap[region.Region.GetId()] = region
 		}
-		for regionID, keys := range splitKeyMap {
-			var newRegions []*RegionInfo
-			region := regionMap[regionID]
-			newRegions, errSplit = rs.splitAndScatterRegions(ctx, region, keys)
-			if errSplit != nil {
-				if strings.Contains(errSplit.Error(), "no valid key") {
-					for _, key := range keys {
-						log.Error("no valid key",
-							zap.Stringer("startKey", utils.WrapKey(region.Region.StartKey)),
-							zap.Stringer("endKey", utils.WrapKey(region.Region.EndKey)),
-							zap.Stringer("key", utils.WrapKey(codec.EncodeBytes([]byte{}, key))))
-					}
-					return errors.Trace(errSplit)
-				}
-				interval = 2 * interval
-				if interval > SplitMaxRetryInterval {
-					interval = SplitMaxRetryInterval
-				}
-				time.Sleep(interval)
-				if i > 3 {
-					log.Warn("splitting regions failed, retry it", zap.Error(errSplit), zap.Array("keys", utils.WrapKeys(keys)))
-				}
-				continue SplitRegions
-			}
-			log.Debug("split regions", utils.ZapRegion(region.Region), zap.Array("keys", utils.WrapKeys(keys)))
-			scatterRegions = append(scatterRegions, newRegions...)
-			onSplit(keys)
+
+		newRegions, retry, errSplit = rs.splitAndCollect(ctx, splitAndScatterKeyMap, regionMap, onSplit)
+		if errSplit != nil {
+			return errSplit
 		}
+		if retry {
+			continue SplitRegions
+		}
+		_, retry, errSplit = rs.splitAndCollect(ctx, splitKeyMap, regionMap, onSplit)
+		if errSplit != nil {
+			return errSplit
+		}
+		if retry {
+			continue SplitRegions
+		}
+		scatterRegions = append(scatterRegions, newRegions...)
 		break
 	}
 	if errSplit != nil {
@@ -241,6 +235,57 @@ func (rs *RegionSplitter) waitForScatterRegion(ctx context.Context, regionInfo *
 	}
 }
 
+func (rs *RegionSplitter) splitAndCollect(
+	ctx context.Context,
+	keyMap map[uint64][][]byte,
+	regionMap map[uint64]*RegionInfo,
+	onSplit OnSplitFunc) ([]*RegionInfo, bool, error) {
+	interval := SplitRetryInterval
+	scatterRegions := make([]*RegionInfo, 0)
+
+	for regionID, keys := range keyMap {
+		var newRegions []*RegionInfo
+		region := regionMap[regionID]
+		newRegions, errSplit := rs.splitRegions(ctx, region, keys)
+		if errSplit != nil {
+			if strings.Contains(errSplit.Error(), "no valid key") {
+				for _, key := range keys {
+					log.Error("no valid key",
+						zap.Stringer("startKey", utils.WrapKey(region.Region.StartKey)),
+						zap.Stringer("endKey", utils.WrapKey(region.Region.EndKey)),
+						zap.Stringer("key", utils.WrapKey(codec.EncodeBytes([]byte{}, key))))
+				}
+				return nil, false, errors.Trace(errSplit)
+			}
+			interval = 2 * interval
+			if interval > ScatterMaxWaitInterval {
+				interval = ScatterMaxWaitInterval
+			}
+			time.Sleep(interval)
+			return nil, true, nil
+		}
+
+		log.Debug("split scatter regions", utils.ZapRegion(region.Region), zap.Array("keys", utils.WrapKeys(keys)))
+		scatterRegions = append(scatterRegions, newRegions...)
+		onSplit(keys)
+	}
+	return scatterRegions, false, nil
+}
+
+func (rs *RegionSplitter) splitRegions(
+	ctx context.Context, regionInfo *RegionInfo, keys [][]byte,
+) ([]*RegionInfo, error) {
+	newRegions, err := rs.client.BatchSplitRegions(ctx, regionInfo, keys)
+	if err != nil {
+		return nil, err
+	}
+	for _, region := range newRegions {
+		// Wait for a while until the regions successfully splits.
+		rs.waitForSplit(ctx, region.Region.Id)
+	}
+	return newRegions, nil
+}
+
 func (rs *RegionSplitter) splitAndScatterRegions(
 	ctx context.Context, regionInfo *RegionInfo, keys [][]byte,
 ) ([]*RegionInfo, error) {
@@ -258,9 +303,7 @@ func (rs *RegionSplitter) splitAndScatterRegions(
 	return newRegions, nil
 }
 
-// getSplitKeys checks if the regions should be split by the new prefix of the rewrites rule and the end key of
-// the ranges, groups the split keys by region id.
-func getSplitKeys(rewriteRules *RewriteRules, ranges []rtree.Range, regions []*RegionInfo) map[uint64][][]byte {
+func getSplitAndScatterKeys(rewriteRules *RewriteRules, regions []*RegionInfo) map[uint64][][]byte {
 	splitKeyMap := make(map[uint64][][]byte)
 	checkKeys := make([][]byte, 0)
 	for _, rule := range rewriteRules.Table {
@@ -269,20 +312,29 @@ func getSplitKeys(rewriteRules *RewriteRules, ranges []rtree.Range, regions []*R
 	for _, rule := range rewriteRules.Data {
 		checkKeys = append(checkKeys, rule.GetNewKeyPrefix())
 	}
-	curSize := 0
-	lastEndKey := []byte{}
-	for _, rg := range ranges {
-		curSize += rg.ApproximateSize
-		_, indexID, isRecord, _ := tablecodec.DecodeKeyHead(rg.EndKey)
-		_, LastIndexID, isLastRecord, _ := tablecodec.DecodeKeyHead(lastEndKey)
-		if curSize > (96<<20) ||
-			lastEndKey == nil ||
-			(isLastRecord && !isRecord) ||
-			(indexID > 0 && indexID != LastIndexID) {
-			checkKeys = append(checkKeys, truncateRowKey(rg.EndKey))
-			curSize = 0
+	for _, key := range checkKeys {
+		if region := NeedSplit(key, regions); region != nil {
+			splitKeys, ok := splitKeyMap[region.Region.GetId()]
+			if !ok {
+				splitKeys = make([][]byte, 0, 1)
+			}
+			splitKeyMap[region.Region.GetId()] = append(splitKeys, key)
+			log.Debug("get key for split and scatter region",
+				zap.Stringer("key", utils.WrapKey(key)),
+				zap.Stringer("startKey", utils.WrapKey(region.Region.StartKey)),
+				zap.Stringer("endKey", utils.WrapKey(region.Region.EndKey)))
 		}
-		lastEndKey = rg.EndKey
+	}
+	return splitKeyMap
+}
+
+// getSplitKeys checks if the regions should be split by the new prefix of the rewrites rule and the end key of
+// the ranges, groups the split keys by region id.
+func getSplitKeys(ranges []rtree.Range, regions []*RegionInfo) map[uint64][][]byte {
+	splitKeyMap := make(map[uint64][][]byte)
+	checkKeys := make([][]byte, 0)
+	for _, rg := range ranges {
+		checkKeys = append(checkKeys, truncateRowKey(rg.EndKey))
 	}
 	for _, key := range checkKeys {
 		if region := NeedSplit(key, regions); region != nil {
