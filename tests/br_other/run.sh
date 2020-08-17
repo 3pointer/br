@@ -105,7 +105,7 @@ run_br --version
 run_br -V
 
 # generate table with auto_inc_id
-run_sql "create table $DB.autoid(auto_inc_id bigint(20) NOT NULL AUTO_INCREMENT)"
+run_sql "create table $DB.autoid(auto_inc_id bigint primary key auto_increment)"
 run_sql "insert into $DB.autoid values(9223372036854775805)"
 
 run_sql "create table $DB.autoid2(auto_inc_id bigint unsigned primary key auto_increment)"
