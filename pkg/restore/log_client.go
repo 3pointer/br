@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 
 	"github.com/pingcap/br/pkg/restore/cdclog"
+	"github.com/pingcap/br/pkg/storage"
 	"github.com/pingcap/br/pkg/utils"
 )
 
@@ -198,7 +199,12 @@ func (l *LogClient) needRestoreDDL(fileName string) (bool, error) {
 
 func (l *LogClient) collectDDLFiles(ctx context.Context) ([]string, error) {
 	ddlFiles := make([]string, 0)
-	err := l.restoreClient.storage.WalkDir(ctx, ddlEventsDir, -1, func(path string, size int64) error {
+	opt := storage.WalkOption{
+		SubDir: ddlEventsDir,
+		ListCount: -1,
+		RemovePrefix: true,
+	}
+	err := l.restoreClient.storage.WalkDir(ctx, opt, func(path string, size int64) error {
 		fileName := filepath.Base(path)
 		shouldRestore, err := l.needRestoreDDL(fileName)
 		if err != nil {
@@ -259,7 +265,12 @@ func (l *LogClient) collectRowChangeFiles(ctx context.Context) (map[int64][]stri
 		tableID := tID
 		// FIXME update log meta logic here
 		dir := fmt.Sprintf("%s%d", tableLogPrefix, tableID)
-		err := l.restoreClient.storage.WalkDir(ctx, dir, -1, func(path string, size int64) error {
+		opt := storage.WalkOption{
+			SubDir: dir,
+			ListCount: -1,
+			RemovePrefix: true,
+		}
+		err := l.restoreClient.storage.WalkDir(ctx, opt, func(path string, size int64) error {
 			fileName := filepath.Base(path)
 			shouldRestore, err := l.needRestoreRowChange(fileName)
 			if err != nil {
