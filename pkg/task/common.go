@@ -53,6 +53,7 @@ const (
 	flagRateLimitUnit       = "ratelimit-unit"
 	flagConcurrency         = "concurrency"
 	flagChecksum            = "checksum"
+	flagAllowSystemDB       = "allow-system-db"
 	flagFilter              = "filter"
 	flagCaseSensitive       = "case-sensitive"
 	flagRemoveTiFlash       = "remove-tiflash"
@@ -109,6 +110,11 @@ type Config struct {
 	// LogProgress is true means the progress bar is printed to the log instead of stdout.
 	LogProgress bool `json:"log-progress" toml:"log-progress"`
 
+	// AllowSystemDB is true in backup means backup system database to sst file.
+	// in restore means restore sst file to system database, and
+	// this operation will cover the origin system database data.
+	AllowSystemDB bool `json:"allow-system-db" toml:"allow-system-db"`
+
 	// CaseSensitive should not be used.
 	//
 	// Deprecated: This field is kept only to satisfy the cyclic dependency with TiDB. This field
@@ -143,6 +149,7 @@ func DefineCommonFlags(flags *pflag.FlagSet) {
 
 	flags.Uint64(flagRateLimit, 0, "The rate limit of the task, MB/s per node")
 	flags.Bool(flagChecksum, true, "Run checksum at end of task")
+	flags.Bool(flagAllowSystemDB, false, "backup/restore system database or not")
 	flags.Bool(flagRemoveTiFlash, true,
 		"Remove TiFlash replicas before backup or restore, for unsupported versions of TiFlash")
 
@@ -235,6 +242,10 @@ func (cfg *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 		return errors.Trace(err)
 	}
 	cfg.Checksum, err = flags.GetBool(flagChecksum)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	cfg.AllowSystemDB, err = flags.GetBool(flagAllowSystemDB)
 	if err != nil {
 		return errors.Trace(err)
 	}

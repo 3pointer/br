@@ -251,6 +251,7 @@ func BuildBackupRangeAndSchema(
 	tableFilter filter.Filter,
 	backupTS uint64,
 	ignoreStats bool,
+	allowSystemDB bool,
 ) ([]rtree.Range, *Schemas, error) {
 	info, err := dom.GetSnapshotInfoSchema(backupTS)
 	if err != nil {
@@ -262,9 +263,18 @@ func BuildBackupRangeAndSchema(
 	ranges := make([]rtree.Range, 0)
 	backupSchemas := newBackupSchemas()
 	for _, dbInfo := range info.AllSchemas() {
-		// skip system databases
-		if util.IsMemOrSysDB(dbInfo.Name.L) {
-			continue
+		if allowSystemDB {
+			// skip mem database only.
+			if util.IsMemDB(dbInfo.Name.L) {
+				log.Info("skip backup database", zap.Stringer("db", dbInfo.Name))
+				continue
+			}
+		} else {
+			// skip system or mem databases.
+			if util.IsMemOrSysDB(dbInfo.Name.L) {
+				log.Info("skip backup database", zap.Stringer("db", dbInfo.Name))
+				continue
+			}
 		}
 
 		var dbData []byte

@@ -255,7 +255,7 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 	}
 
 	ranges, backupSchemas, err := backup.BuildBackupRangeAndSchema(
-		mgr.GetDomain(), mgr.GetTiKV(), cfg.TableFilter, backupTS, cfg.IgnoreStats)
+		mgr.GetDomain(), mgr.GetTiKV(), cfg.TableFilter, backupTS, cfg.IgnoreStats, cfg.AllowSystemDB)
 	if err != nil {
 		return errors.Trace(err)
 	}

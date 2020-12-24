@@ -11,6 +11,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/backup"
 	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/util"
 	"github.com/spf13/pflag"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
@@ -335,6 +336,11 @@ func filterRestoreFiles(
 	cfg *RestoreConfig,
 ) (files []*backup.File, tables []*utils.Table, dbs []*utils.Database) {
 	for _, db := range client.GetDatabases() {
+		// skip system database
+		if !cfg.AllowSystemDB && util.IsMemOrSysDB(db.Info.Name.L) {
+			log.Info("filter system database because of config `allow-system-db` set to false")
+			continue
+		}
 		createdDatabase := false
 		for _, table := range db.Tables {
 			if !cfg.TableFilter.MatchTable(db.Info.Name.O, table.Info.Name.O) {
