@@ -6,29 +6,28 @@ import (
 	"context"
 	"sync"
 
+	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/backup"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/log"
 	"go.uber.org/zap"
 
+	berrors "github.com/pingcap/br/pkg/errors"
 	"github.com/pingcap/br/pkg/glue"
 	"github.com/pingcap/br/pkg/rtree"
 )
 
-// pushDown warps a backup task.
+// pushDown wraps a backup task.
 type pushDown struct {
-	ctx    context.Context
 	mgr    ClientMgr
 	respCh chan *backup.BackupResponse
 	errCh  chan error
 }
 
 // newPushDown creates a push down backup.
-func newPushDown(ctx context.Context, mgr ClientMgr, cap int) *pushDown {
-	log.Info("new backup client")
+func newPushDown(mgr ClientMgr, cap int) *pushDown {
 	return &pushDown{
-		ctx:    ctx,
 		mgr:    mgr,
 		respCh: make(chan *backup.BackupResponse, cap),
 		errCh:  make(chan error, cap),
@@ -37,10 +36,17 @@ func newPushDown(ctx context.Context, mgr ClientMgr, cap int) *pushDown {
 
 // FullBackup make a full backup of a tikv cluster.
 func (push *pushDown) pushBackup(
+	ctx context.Context,
 	req backup.BackupRequest,
 	stores []*metapb.Store,
 	updateCh glue.Progress,
 ) (rtree.RangeTree, error) {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("pushDown.pushBackup", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
+	}
+
 	// Push down backup tasks to all tikv instances.
 	res := rtree.NewRangeTree()
 	wg := new(sync.WaitGroup)
@@ -50,7 +56,7 @@ func (push *pushDown) pushBackup(
 			log.Warn("skip store", zap.Uint64("StoreID", storeID), zap.Stringer("State", s.GetState()))
 			continue
 		}
-		client, err := push.mgr.GetBackupClient(push.ctx, storeID)
+		client, err := push.mgr.GetBackupClient(ctx, storeID)
 		if err != nil {
 			log.Error("fail to connect store", zap.Uint64("StoreID", storeID))
 			return res, errors.Trace(err)
@@ -59,11 +65,15 @@ func (push *pushDown) pushBackup(
 		go func() {
 			defer wg.Done()
 			err := SendBackup(
-				push.ctx, storeID, client, req,
+				ctx, storeID, client, req,
 				func(resp *backup.BackupResponse) error {
 					// Forward all responses (including error).
 					push.respCh <- resp
 					return nil
+				},
+				func() (backup.BackupClient, error) {
+					log.Warn("reset the connection in push", zap.Uint64("storeID", storeID))
+					return push.mgr.ResetBackupClient(ctx, storeID)
 				})
 			if err != nil {
 				push.errCh <- err
@@ -99,18 +109,15 @@ func (push *pushDown) pushBackup(
 					log.Warn("backup occur kv error", zap.Reflect("error", v))
 
 				case *backup.Error_RegionError:
-					log.Warn("backup occur region error",
-						zap.Reflect("error", v))
+					log.Warn("backup occur region error", zap.Reflect("error", v))
 
 				case *backup.Error_ClusterIdError:
-					log.Error("backup occur cluster ID error",
-						zap.Reflect("error", v))
-					return res, errors.Errorf("%v", errPb)
+					log.Error("backup occur cluster ID error", zap.Reflect("error", v))
+					return res, errors.Annotatef(berrors.ErrKVClusterIDMismatch, "%v", errPb)
 
 				default:
-					log.Error("backup occur unknown error",
-						zap.String("error", errPb.GetMsg()))
-					return res, errors.Errorf("%v", errPb)
+					log.Error("backup occur unknown error", zap.String("error", errPb.GetMsg()))
+					return res, errors.Annotatef(berrors.ErrKVUnknown, "%v", errPb)
 				}
 			}
 		case err := <-push.errCh:

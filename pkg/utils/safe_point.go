@@ -1,6 +1,6 @@
 // Copyright 2020 PingCAP, Inc. Licensed under Apache-2.0.
 
-package backup
+package utils
 
 import (
 	"context"
@@ -10,17 +10,19 @@ import (
 	"github.com/google/uuid"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	pd "github.com/pingcap/pd/v4/client"
-	"github.com/pingcap/pd/v4/pkg/tsoutil"
+	pd "github.com/tikv/pd/client"
+	"github.com/tikv/pd/pkg/tsoutil"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+
+	berrors "github.com/pingcap/br/pkg/errors"
 )
 
 const (
 	brServiceSafePointIDFormat      = "br-%s"
 	preUpdateServiceSafePointFactor = 3
 	checkGCSafePointGapTime         = 5 * time.Second
-	// DefaultBRGCSafePointTTL means PD keep safePoint limit at least 5min
+	// DefaultBRGCSafePointTTL means PD keep safePoint limit at least 5min.
 	DefaultBRGCSafePointTTL = 5 * 60
 )
 
@@ -47,7 +49,7 @@ func (sp BRServiceSafePoint) MarshalLogObject(encoder zapcore.ObjectEncoder) err
 func getGCSafePoint(ctx context.Context, pdClient pd.Client) (uint64, error) {
 	safePoint, err := pdClient.UpdateGCSafePoint(ctx, 0)
 	if err != nil {
-		return 0, err
+		return 0, errors.Trace(err)
 	}
 	return safePoint, nil
 }
@@ -67,7 +69,7 @@ func CheckGCSafePoint(ctx context.Context, pdClient pd.Client, ts uint64) error 
 		return nil
 	}
 	if ts <= safePoint {
-		return errors.Errorf("GC safepoint %d exceed TS %d", safePoint, ts)
+		return errors.Annotatef(berrors.ErrBackupGCSafepointExceeded, "GC safepoint %d exceed TS %d", safePoint, ts)
 	}
 	return nil
 }
@@ -85,7 +87,7 @@ func UpdateServiceSafePoint(ctx context.Context, pdClient pd.Client, sp BRServic
 			zap.Object("safePoint", sp),
 		)
 	}
-	return err
+	return errors.Trace(err)
 }
 
 // StartServiceSafePointKeeper will run UpdateServiceSafePoint periodicity
@@ -121,7 +123,7 @@ func StartServiceSafePointKeeper(
 		for {
 			select {
 			case <-ctx.Done():
-				log.Info("service safe point keeper exited")
+				log.Debug("service safe point keeper exited")
 				return
 			case <-updateTick.C:
 				update(ctx)

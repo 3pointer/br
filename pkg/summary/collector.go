@@ -44,7 +44,7 @@ type LogCollector interface {
 
 type logFunc func(msg string, fields ...zap.Field)
 
-var collector LogCollector = newLogCollector(log.Info)
+var collector LogCollector = NewLogCollector(log.Info)
 
 // InitCollector initilize global collector instance.
 func InitCollector( // revive:disable-line:flag-parameter
@@ -62,7 +62,7 @@ func InitCollector( // revive:disable-line:flag-parameter
 			}
 		}
 	}
-	collector = newLogCollector(logF)
+	collector = NewLogCollector(logF)
 }
 
 type logCollector struct {
@@ -77,11 +77,13 @@ type logCollector struct {
 	ints             map[string]int
 	uints            map[string]uint64
 	successStatus    bool
+	startTime        time.Time
 
 	log logFunc
 }
 
-func newLogCollector(log logFunc) LogCollector {
+// NewLogCollector returns a new LogCollector.
+func NewLogCollector(log logFunc) LogCollector {
 	return &logCollector{
 		successUnitCount: 0,
 		failureUnitCount: 0,
@@ -92,6 +94,7 @@ func newLogCollector(log logFunc) LogCollector {
 		ints:             make(map[string]int),
 		uints:            make(map[string]uint64),
 		log:              log,
+		startTime:        time.Now(),
 	}
 }
 
@@ -189,7 +192,8 @@ func (tc *logCollector) Summary(name string) {
 	for _, cost := range tc.successCosts {
 		totalCost += cost
 	}
-	msg += fmt.Sprintf(", total take(s): %.2f", totalCost.Seconds())
+	msg += fmt.Sprintf(", total take(%s time): %s", name, totalCost)
+	msg += fmt.Sprintf(", total take(real time): %s", time.Since(tc.startTime))
 	for name, data := range tc.successData {
 		if name == TotalBytes {
 			fData := float64(data) / 1024 / 1024

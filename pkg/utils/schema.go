@@ -10,11 +10,12 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/backup"
 	"github.com/pingcap/parser/model"
+	"github.com/pingcap/tidb/statistics/handle"
 	"github.com/pingcap/tidb/tablecodec"
 )
 
 const (
-	// LockFile represents file name,
+	// LockFile represents file name
 	LockFile = "backup.lock"
 	// MetaFile represents file name
 	MetaFile = "backupmeta"
@@ -26,13 +27,14 @@ const (
 
 // Table wraps the schema and files of a table.
 type Table struct {
-	Db              *model.DBInfo
+	DB              *model.DBInfo
 	Info            *model.TableInfo
 	Crc64Xor        uint64
 	TotalKvs        uint64
 	TotalBytes      uint64
 	Files           []*backup.File
 	TiFlashReplicas int
+	Stats           *handle.JSONTable
 }
 
 // NoChecksum checks whether the table has a calculated checksum.
@@ -88,6 +90,15 @@ func LoadBackupTables(meta *backup.BackupMeta) (map[string]*Database, error) {
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
+		// stats maybe nil from old backup file.
+		stats := &handle.JSONTable{}
+		if schema.Stats != nil {
+			// Parse the stats table.
+			err = json.Unmarshal(schema.Stats, stats)
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+		}
 		partitions := make(map[int64]bool)
 		if tableInfo.Partition != nil {
 			for _, p := range tableInfo.Partition.Definitions {
@@ -109,13 +120,14 @@ func LoadBackupTables(meta *backup.BackupMeta) (map[string]*Database, error) {
 			}
 		}
 		table := &Table{
-			Db:              dbInfo,
+			DB:              dbInfo,
 			Info:            tableInfo,
 			Crc64Xor:        schema.Crc64Xor,
 			TotalKvs:        schema.TotalKvs,
 			TotalBytes:      schema.TotalBytes,
 			Files:           tableFiles,
 			TiFlashReplicas: int(schema.TiflashReplicas),
+			Stats:           stats,
 		}
 		db.Tables = append(db.Tables, table)
 	}

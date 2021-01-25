@@ -11,7 +11,7 @@ import (
 	"github.com/pingcap/log"
 	"go.uber.org/zap"
 
-	"github.com/pingcap/br/pkg/utils"
+	"github.com/pingcap/br/pkg/logutil"
 )
 
 // Range represents a backup response.
@@ -24,6 +24,15 @@ type Range struct {
 // String formats a range to a string.
 func (rg *Range) String() string {
 	return fmt.Sprintf("[%x %x]", rg.StartKey, rg.EndKey)
+}
+
+// BytesAndKeys returns total bytes and keys in a range.
+func (rg *Range) BytesAndKeys() (bytes, keys uint64) {
+	for _, f := range rg.Files {
+		bytes += f.TotalBytes
+		keys += f.TotalKvs
+	}
+	return
 }
 
 // Intersect returns intersect range in the tree.
@@ -134,8 +143,8 @@ func (rangeTree *RangeTree) Update(rg Range) {
 	// Range has backuped, overwrite overlapping range.
 	for _, item := range overlaps {
 		log.Info("delete overlapping range",
-			zap.Stringer("StartKey", utils.WrapKey(item.StartKey)),
-			zap.Stringer("EndKey", utils.WrapKey(item.EndKey)),
+			zap.Stringer("StartKey", logutil.WrapKey(item.StartKey)),
+			zap.Stringer("EndKey", logutil.WrapKey(item.EndKey)),
 		)
 		rangeTree.Delete(item)
 	}

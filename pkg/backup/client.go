@@ -6,18 +6,20 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"sync"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/google/btree"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	kvproto "github.com/pingcap/kvproto/pkg/backup"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/log"
 	"github.com/pingcap/parser/model"
-	pd "github.com/pingcap/pd/v4/client"
 	filter "github.com/pingcap/tidb-tools/pkg/table-filter"
 	"github.com/pingcap/tidb/distsql"
 	"github.com/pingcap/tidb/domain"
@@ -29,11 +31,16 @@ import (
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/ranger"
+	pd "github.com/tikv/pd/client"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/pingcap/br/pkg/conn"
+	berrors "github.com/pingcap/br/pkg/errors"
 	"github.com/pingcap/br/pkg/glue"
+	"github.com/pingcap/br/pkg/logutil"
 	"github.com/pingcap/br/pkg/rtree"
 	"github.com/pingcap/br/pkg/storage"
 	"github.com/pingcap/br/pkg/summary"
@@ -43,6 +50,7 @@ import (
 // ClientMgr manages connections needed by backup.
 type ClientMgr interface {
 	GetBackupClient(ctx context.Context, storeID uint64) (kvproto.BackupClient, error)
+	ResetBackupClient(ctx context.Context, storeID uint64) (kvproto.BackupClient, error)
 	GetPDClient() pd.Client
 	GetTiKV() tikv.Storage
 	GetLockResolver() *tikv.LockResolver
@@ -59,6 +67,7 @@ type Checksum struct {
 // Maximum total sleep time(in ms) for kv/cop commands.
 const (
 	backupFineGrainedMaxBackoff = 80000
+	backupRetryTimes            = 5
 )
 
 // Client is a client instructs TiKV how to do a backup.
@@ -100,21 +109,21 @@ func (bc *Client) GetTS(ctx context.Context, duration time.Duration, ts uint64) 
 
 		switch {
 		case duration < 0:
-			return 0, errors.New("negative timeago is not allowed")
+			return 0, errors.Annotate(berrors.ErrInvalidArgument, "negative timeago is not allowed")
 		case duration > 0:
 			log.Info("backup time ago", zap.Duration("timeago", duration))
 
 			backupTime := oracle.GetTimeFromTS(backupTS)
 			backupAgo := backupTime.Add(-duration)
 			if backupTS < oracle.ComposeTS(oracle.GetPhysical(backupAgo), l) {
-				return 0, errors.New("backup ts overflow please choose a smaller timeago")
+				return 0, errors.Annotate(berrors.ErrInvalidArgument, "backup ts overflow please choose a smaller timeago")
 			}
 			backupTS = oracle.ComposeTS(oracle.GetPhysical(backupAgo), l)
 		}
 	}
 
 	// check backup time do not exceed GCSafePoint
-	err = CheckGCSafePoint(ctx, bc.mgr.GetPDClient(), backupTS)
+	err = utils.CheckGCSafePoint(ctx, bc.mgr.GetPDClient(), backupTS)
 	if err != nil {
 		return 0, errors.Trace(err)
 	}
@@ -124,7 +133,7 @@ func (bc *Client) GetTS(ctx context.Context, duration time.Duration, ts uint64) 
 
 // SetLockFile set write lock file.
 func (bc *Client) SetLockFile(ctx context.Context) error {
-	return bc.storage.Write(ctx, utils.LockFile,
+	return bc.storage.WriteFile(ctx, utils.LockFile,
 		[]byte("DO NOT DELETE\n"+
 			"This file exists to remind other backup jobs won't use this path"))
 }
@@ -132,7 +141,7 @@ func (bc *Client) SetLockFile(ctx context.Context) error {
 // SetGCTTL set gcTTL for client.
 func (bc *Client) SetGCTTL(ttl int64) {
 	if ttl <= 0 {
-		ttl = DefaultBRGCSafePointTTL
+		ttl = utils.DefaultBRGCSafePointTTL
 	}
 	bc.gcTTL = ttl
 }
@@ -147,7 +156,7 @@ func (bc *Client) SetStorage(ctx context.Context, backend *kvproto.StorageBacken
 	var err error
 	bc.storage, err = storage.Create(ctx, backend, sendCreds)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	// backupmeta already exists
 	exist, err := bc.storage.FileExists(ctx, utils.MetaFile)
@@ -155,14 +164,14 @@ func (bc *Client) SetStorage(ctx context.Context, backend *kvproto.StorageBacken
 		return errors.Annotatef(err, "error occurred when checking %s file", utils.MetaFile)
 	}
 	if exist {
-		return errors.New("backup meta exists, may be some backup files in the path already")
+		return errors.Annotate(berrors.ErrInvalidArgument, "backup meta exists, may be some backup files in the path already")
 	}
 	exist, err = bc.storage.FileExists(ctx, utils.LockFile)
 	if err != nil {
 		return errors.Annotatef(err, "error occurred when checking %s file", utils.LockFile)
 	}
 	if exist {
-		return errors.New("backup lock exists, may be some backup files in the path already")
+		return errors.Annotate(berrors.ErrInvalidArgument, "backup lock exists, may be some backup files in the path already")
 	}
 	bc.backend = backend
 	return nil
@@ -190,6 +199,12 @@ func BuildBackupMeta(
 
 // SaveBackupMeta saves the current backup meta at the given path.
 func (bc *Client) SaveBackupMeta(ctx context.Context, backupMeta *kvproto.BackupMeta) error {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("Client.SaveBackupMeta", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
+	}
+
 	backupMetaData, err := proto.Marshal(backupMeta)
 	if err != nil {
 		return errors.Trace(err)
@@ -197,7 +212,7 @@ func (bc *Client) SaveBackupMeta(ctx context.Context, backupMeta *kvproto.Backup
 	log.Debug("backup meta", zap.Reflect("meta", backupMeta))
 	backendURL := storage.FormatBackendURL(bc.backend)
 	log.Info("save backup meta", zap.Stringer("path", &backendURL), zap.Int("size", len(backupMetaData)))
-	return bc.storage.Write(ctx, utils.MetaFile, backupMetaData)
+	return bc.storage.WriteFile(ctx, utils.MetaFile, backupMetaData)
 }
 
 // BuildTableRanges returns the key ranges encompassing the entire table,
@@ -213,7 +228,7 @@ func BuildTableRanges(tbl *model.TableInfo) ([]kv.KeyRange, error) {
 	for _, def := range pis.Definitions {
 		rgs, err := appendRanges(tbl, def.ID)
 		if err != nil {
-			return nil, err
+			return nil, errors.Trace(err)
 		}
 		ranges = append(ranges, rgs...)
 	}
@@ -237,17 +252,22 @@ func appendRanges(tbl *model.TableInfo, tblID int64) ([]kv.KeyRange, error) {
 	return kvRanges, nil
 }
 
-// BuildBackupRangeAndSchema gets the range and schema of tables.
+// BuildBackupRangeAndSchema gets KV range and schema of tables.
+// KV ranges are separated by Table IDs.
+// Also, KV ranges are separated by Index IDs in the same table.
 func BuildBackupRangeAndSchema(
 	dom *domain.Domain,
 	storage kv.Storage,
 	tableFilter filter.Filter,
 	backupTS uint64,
+	ignoreStats bool,
 ) ([]rtree.Range, *Schemas, error) {
 	info, err := dom.GetSnapshotInfoSchema(backupTS)
 	if err != nil {
 		return nil, nil, errors.Trace(err)
 	}
+
+	h := dom.StatsHandle()
 
 	ranges := make([]rtree.Range, 0)
 	backupSchemas := newBackupSchemas()
@@ -262,11 +282,22 @@ func BuildBackupRangeAndSchema(
 		seqAlloc := autoid.NewAllocator(storage, dbInfo.ID, false, autoid.SequenceType)
 		randAlloc := autoid.NewAllocator(storage, dbInfo.ID, false, autoid.AutoRandomType)
 
+		if len(dbInfo.Tables) == 0 {
+			log.Warn("It's not necessary for backing up empty database",
+				zap.Stringer("db", dbInfo.Name))
+			continue
+		}
 		for _, tableInfo := range dbInfo.Tables {
 			if !tableFilter.MatchTable(dbInfo.Name.O, tableInfo.Name.O) {
 				// Skip tables other than the given table.
 				continue
 			}
+
+			logger := log.With(
+				zap.String("db", dbInfo.Name.O),
+				zap.String("table", tableInfo.Name.O),
+			)
+
 			var globalAutoID int64
 			switch {
 			case tableInfo.IsSequence():
@@ -289,14 +320,10 @@ func BuildBackupRangeAndSchema(
 					return nil, nil, errors.Trace(err)
 				}
 				tableInfo.AutoRandID = globalAutoRandID
-				log.Info("change table AutoRandID",
-					zap.Stringer("db", dbInfo.Name),
-					zap.Stringer("table", tableInfo.Name),
+				logger.Info("change table AutoRandID",
 					zap.Int64("AutoRandID", globalAutoRandID))
 			}
-			log.Info("change table AutoIncID",
-				zap.Stringer("db", dbInfo.Name),
-				zap.Stringer("table", tableInfo.Name),
+			logger.Info("change table AutoIncID",
 				zap.Int64("AutoIncID", globalAutoID))
 
 			// remove all non-public indices
@@ -320,15 +347,29 @@ func BuildBackupRangeAndSchema(
 				return nil, nil, errors.Trace(err)
 			}
 
+			var stats []byte
+			if !ignoreStats {
+				jsonTable, err := h.DumpStatsToJSON(dbInfo.Name.String(), tableInfo, nil)
+				if err != nil {
+					logger.Error("dump table stats failed", logutil.ShortError(err))
+				} else {
+					stats, err = json.Marshal(jsonTable)
+					if err != nil {
+						logger.Error("dump table stats failed (cannot serialize)", logutil.ShortError(err))
+					}
+				}
+			}
+
 			schema := kvproto.Schema{
 				Db:    dbData,
 				Table: tableData,
+				Stats: stats,
 			}
 			backupSchemas.pushPending(schema, dbInfo.Name.L, tableInfo.Name.L)
 
 			tableRanges, err := BuildTableRanges(tableInfo)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, errors.Trace(err)
 			}
 			for _, r := range tableRanges {
 				ranges = append(ranges, rtree.Range{
@@ -399,9 +440,13 @@ func (bc *Client) BackupRanges(
 	concurrency uint,
 	updateCh glue.Progress,
 ) ([]*kvproto.File, error) {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("Client.BackupRanges", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
+	}
+
 	errCh := make(chan error)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	// we collect all files in a single goroutine to avoid thread safety issues.
 	filesCh := make(chan []*kvproto.File, concurrency)
@@ -431,7 +476,7 @@ func (bc *Client) BackupRanges(
 				if err == nil {
 					filesCh <- files
 				}
-				return err
+				return errors.Trace(err)
 			})
 		}
 		if err := eg.Wait(); err != nil {
@@ -441,13 +486,9 @@ func (bc *Client) BackupRanges(
 		close(errCh)
 	}()
 
-	// Check GC safepoint every 5s.
-	t := time.NewTicker(time.Second * 5)
-	defer t.Stop()
-
 	for err := range errCh {
 		if err != nil {
-			return nil, err
+			return nil, errors.Trace(err)
 		}
 	}
 
@@ -477,12 +518,10 @@ func (bc *Client) BackupRange(
 		}
 	}()
 	log.Info("backup started",
-		zap.Stringer("StartKey", utils.WrapKey(startKey)),
-		zap.Stringer("EndKey", utils.WrapKey(endKey)),
+		zap.Stringer("StartKey", logutil.WrapKey(startKey)),
+		zap.Stringer("EndKey", logutil.WrapKey(endKey)),
 		zap.Uint64("RateLimit", req.RateLimit),
 		zap.Uint32("Concurrency", req.Concurrency))
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	var allStores []*metapb.Store
 	allStores, err = conn.GetAllTiKVStores(ctx, bc.mgr.GetPDClient(), conn.SkipTiFlash)
@@ -495,12 +534,12 @@ func (bc *Client) BackupRange(
 	req.EndKey = endKey
 	req.StorageBackend = bc.backend
 
-	push := newPushDown(ctx, bc.mgr, len(allStores))
+	push := newPushDown(bc.mgr, len(allStores))
 
 	var results rtree.RangeTree
-	results, err = push.pushBackup(req, allStores, updateCh)
+	results, err = push.pushBackup(ctx, req, allStores, updateCh)
 	if err != nil {
-		return nil, err
+		return nil, errors.Trace(err)
 	}
 	log.Info("finish backup push down", zap.Int("Ok", results.Len()))
 
@@ -510,13 +549,13 @@ func (bc *Client) BackupRange(
 		ctx, startKey, endKey, req.StartVersion, req.EndVersion, req.CompressionType, req.CompressionLevel,
 		req.RateLimit, req.Concurrency, results, updateCh)
 	if err != nil {
-		return nil, err
+		return nil, errors.Trace(err)
 	}
 
 	if req.IsRawKv {
 		log.Info("backup raw ranges",
-			zap.Stringer("startKey", utils.WrapKey(startKey)),
-			zap.Stringer("endKey", utils.WrapKey(endKey)),
+			zap.Stringer("startKey", logutil.WrapKey(startKey)),
+			zap.Stringer("endKey", logutil.WrapKey(endKey)),
 			zap.String("cf", req.Cf))
 	} else {
 		log.Info("backup time range",
@@ -537,30 +576,29 @@ func (bc *Client) BackupRange(
 	return files, nil
 }
 
-func (bc *Client) findRegionLeader(
-	ctx context.Context,
-	key []byte) (*metapb.Peer, error) {
+func (bc *Client) findRegionLeader(ctx context.Context, key []byte) (*metapb.Peer, error) {
 	// Keys are saved in encoded format in TiKV, so the key must be encoded
 	// in order to find the correct region.
 	key = codec.EncodeBytes([]byte{}, key)
 	for i := 0; i < 5; i++ {
 		// better backoff.
 		region, err := bc.mgr.GetPDClient().GetRegion(ctx, key)
-		if err != nil {
-			log.Error("find leader failed", zap.Error(err))
+		if err != nil || region == nil {
+			log.Error("find leader failed", zap.Error(err), zap.Reflect("region", region))
 			time.Sleep(time.Millisecond * time.Duration(100*i))
 			continue
 		}
 		if region.Leader != nil {
 			log.Info("find leader",
-				zap.Reflect("Leader", region.Leader), zap.Stringer("Key", utils.WrapKey(key)))
+				zap.Reflect("Leader", region.Leader), zap.Stringer("Key", logutil.WrapKey(key)))
 			return region.Leader, nil
 		}
-		log.Warn("no region found", zap.Stringer("Key", utils.WrapKey(key)))
+		log.Warn("no region found", zap.Stringer("Key", logutil.WrapKey(key)))
 		time.Sleep(time.Millisecond * time.Duration(100*i))
 		continue
 	}
-	return nil, errors.Errorf("can not find leader for key %v", key)
+	log.Error("can not find leader", zap.Stringer("key", logutil.WrapKey(key)))
+	return nil, errors.Annotatef(berrors.ErrBackupNoLeader, "can not find leader")
 }
 
 func (bc *Client) fineGrainedBackup(
@@ -575,6 +613,12 @@ func (bc *Client) fineGrainedBackup(
 	rangeTree rtree.RangeTree,
 	updateCh glue.Progress,
 ) error {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("Client.fineGrainedBackup", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
+	}
+
 	bo := tikv.NewBackoffer(ctx, backupFineGrainedMaxBackoff)
 	for {
 		// Step1, check whether there is any incomplete range
@@ -632,19 +676,19 @@ func (bc *Client) fineGrainedBackup(
 			select {
 			case err := <-errCh:
 				// TODO: should we handle err here?
-				return err
+				return errors.Trace(err)
 			case resp, ok := <-respCh:
 				if !ok {
 					// Finished.
 					break selectLoop
 				}
 				if resp.Error != nil {
-					log.Fatal("unexpected backup error",
+					log.Panic("unexpected backup error",
 						zap.Reflect("error", resp.Error))
 				}
 				log.Info("put fine grained range",
-					zap.Stringer("StartKey", utils.WrapKey(resp.StartKey)),
-					zap.Stringer("EndKey", utils.WrapKey(resp.EndKey)),
+					zap.Stringer("StartKey", logutil.WrapKey(resp.StartKey)),
+					zap.Stringer("EndKey", logutil.WrapKey(resp.EndKey)),
 				)
 				rangeTree.Put(resp.StartKey, resp.EndKey, resp.Files)
 
@@ -659,8 +703,9 @@ func (bc *Client) fineGrainedBackup(
 		max.mu.Unlock()
 		if ms != 0 {
 			log.Info("handle fine grained", zap.Int("backoffMs", ms))
-			err := bo.BackoffWithMaxSleep(2, /* magic boTxnLockFast */
-				ms, errors.New("TODO: attach error"))
+			// 2 means tikv.boTxnLockFast
+			// TODO: fill a meaningful error.
+			err := bo.BackoffWithMaxSleep(2, ms, berrors.ErrUnknown)
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -668,13 +713,15 @@ func (bc *Client) fineGrainedBackup(
 	}
 }
 
-func onBackupResponse(
+// OnBackupResponse checks the backup resp, decides whether to retry and generate the error.
+func OnBackupResponse(
+	storeID uint64,
 	bo *tikv.Backoffer,
 	backupTS uint64,
 	lockResolver *tikv.LockResolver,
 	resp *kvproto.BackupResponse,
 ) (*kvproto.BackupResponse, int, error) {
-	log.Debug("onBackupResponse", zap.Reflect("resp", resp))
+	log.Debug("OnBackupResponse", zap.Reflect("resp", resp))
 	if resp.Error == nil {
 		return resp, 0, nil
 	}
@@ -696,7 +743,7 @@ func onBackupResponse(
 		}
 		// Backup should not meet error other than KeyLocked.
 		log.Error("unexpect kv error", zap.Reflect("KvError", v.KvError))
-		return nil, backoffMs, errors.Errorf("onBackupResponse error %v", v)
+		return nil, backoffMs, errors.Annotatef(berrors.ErrKVUnknown, "storeID: %d OnBackupResponse error %v", storeID, v)
 
 	case *kvproto.Error_RegionError:
 		regionErr := v.RegionError
@@ -706,26 +753,24 @@ func onBackupResponse(
 			regionErr.RegionNotFound != nil ||
 			regionErr.ServerIsBusy != nil ||
 			regionErr.StaleCommand != nil ||
-			regionErr.StoreNotMatch != nil) {
-			log.Error("unexpect region error",
-				zap.Reflect("RegionError", regionErr))
-			return nil, backoffMs, errors.Errorf("onBackupResponse error %v", v)
+			regionErr.StoreNotMatch != nil ||
+			regionErr.ReadIndexNotReady != nil ||
+			regionErr.ProposalInMergingMode != nil) {
+			log.Error("unexpect region error", zap.Reflect("RegionError", regionErr))
+			return nil, backoffMs, errors.Annotatef(berrors.ErrKVUnknown, "storeID: %d OnBackupResponse error %v", storeID, v)
 		}
 		log.Warn("backup occur region error",
-			zap.Reflect("RegionError", regionErr))
+			zap.Reflect("RegionError", regionErr),
+			zap.Uint64("storeID", storeID))
 		// TODO: a better backoff.
 		backoffMs = 1000 /* 1s */
 		return nil, backoffMs, nil
 	case *kvproto.Error_ClusterIdError:
-		log.Error("backup occur cluster ID error",
-			zap.Reflect("error", v))
-		err := errors.Errorf("%v", resp.Error)
-		return nil, 0, err
+		log.Error("backup occur cluster ID error", zap.Reflect("error", v), zap.Uint64("storeID", storeID))
+		return nil, 0, errors.Annotatef(berrors.ErrKVClusterIDMismatch, "%v on storeID: %d", resp.Error, storeID)
 	default:
-		log.Error("backup occur unknown error",
-			zap.String("error", resp.Error.GetMsg()))
-		err := errors.Errorf("%v", resp.Error)
-		return nil, 0, err
+		log.Error("backup occur unknown error", zap.String("error", resp.Error.GetMsg()), zap.Uint64("storeID", storeID))
+		return nil, 0, errors.Annotatef(berrors.ErrKVUnknown, "%v on storeID: %d", resp.Error, storeID)
 	}
 }
 
@@ -743,7 +788,7 @@ func (bc *Client) handleFineGrained(
 ) (int, error) {
 	leader, pderr := bc.findRegionLeader(ctx, rg.StartKey)
 	if pderr != nil {
-		return 0, pderr
+		return 0, errors.Trace(pderr)
 	}
 	storeID := leader.GetStoreId()
 	max := 0
@@ -771,7 +816,7 @@ func (bc *Client) handleFineGrained(
 		// Handle responses with the same backoffer.
 		func(resp *kvproto.BackupResponse) error {
 			response, backoffMs, err1 :=
-				onBackupResponse(bo, backupTS, lockResolver, resp)
+				OnBackupResponse(storeID, bo, backupTS, lockResolver, resp)
 			if err1 != nil {
 				return err1
 			}
@@ -782,9 +827,13 @@ func (bc *Client) handleFineGrained(
 				respCh <- response
 			}
 			return nil
+		},
+		func() (kvproto.BackupClient, error) {
+			log.Warn("reset the connection in handleFineGrained", zap.Uint64("storeID", storeID))
+			return bc.mgr.ResetBackupClient(ctx, storeID)
 		})
 	if err != nil {
-		return 0, err
+		return 0, errors.Trace(err)
 	}
 	return max, nil
 }
@@ -797,45 +846,87 @@ func SendBackup(
 	client kvproto.BackupClient,
 	req kvproto.BackupRequest,
 	respFn func(*kvproto.BackupResponse) error,
+	resetFn func() (kvproto.BackupClient, error),
 ) error {
-	log.Info("try backup",
-		zap.Stringer("StartKey", utils.WrapKey(req.StartKey)),
-		zap.Stringer("EndKey", utils.WrapKey(req.EndKey)),
-		zap.Uint64("storeID", storeID),
-	)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	bcli, err := client.Backup(ctx, &req)
-	if err != nil {
-		log.Error("fail to backup", zap.Uint64("StoreID", storeID))
-		return err
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan(
+			fmt.Sprintf("Client.SendBackup, storeID = %d, StartKey = %s, EndKey = %s",
+				storeID, logutil.WrapKey(req.StartKey), logutil.WrapKey(req.EndKey)),
+			opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
 	}
-	for {
-		resp, err := bcli.Recv()
-		if err != nil {
-			if err == io.EOF {
-				log.Info("backup streaming finish",
-					zap.Uint64("StoreID", storeID))
-				break
+
+	var errReset error
+backupLoop:
+	for retry := 0; retry < backupRetryTimes; retry++ {
+		log.Info("try backup",
+			zap.Stringer("StartKey", logutil.WrapKey(req.StartKey)),
+			zap.Stringer("EndKey", logutil.WrapKey(req.EndKey)),
+			zap.Uint64("storeID", storeID),
+			zap.Int("retry time", retry),
+		)
+		bcli, err := client.Backup(ctx, &req)
+		failpoint.Inject("reset-retryable-error", func(val failpoint.Value) {
+			if val.(bool) {
+				log.Debug("failpoint reset-retryable-error injected.")
+				err = status.Errorf(codes.Unavailable, "Unavailable error")
 			}
+		})
+		if err != nil {
+			if isRetryableError(err) {
+				time.Sleep(3 * time.Second)
+				client, errReset = resetFn()
+				if errReset != nil {
+					return errors.Annotatef(errReset, "failed to reset backup connection on store:%d "+
+						"please check the tikv status", storeID)
+				}
+				continue
+			}
+			log.Error("fail to backup", zap.Uint64("StoreID", storeID),
+				zap.Int("retry time", retry))
 			return errors.Trace(err)
 		}
-		// TODO: handle errors in the resp.
-		log.Info("range backuped",
-			zap.Stringer("StartKey", utils.WrapKey(resp.GetStartKey())),
-			zap.Stringer("EndKey", utils.WrapKey(resp.GetEndKey())))
-		err = respFn(resp)
-		if err != nil {
-			return err
+
+		for {
+			resp, err := bcli.Recv()
+			if err != nil {
+				if errors.Cause(err) == io.EOF { // nolint:errorlint
+					log.Info("backup streaming finish",
+						zap.Uint64("StoreID", storeID),
+						zap.Int("retry time", retry))
+					break backupLoop
+				}
+				if isRetryableError(err) {
+					time.Sleep(3 * time.Second)
+					// current tikv is unavailable
+					client, errReset = resetFn()
+					if errReset != nil {
+						return errors.Annotatef(errReset, "failed to reset recv connection on store:%d "+
+							"please check the tikv status", storeID)
+					}
+					break
+				}
+				return errors.Annotatef(err, "failed to connect to store: %d with retry times:%d", storeID, retry)
+			}
+			// TODO: handle errors in the resp.
+			log.Info("range backuped",
+				zap.Stringer("StartKey", logutil.WrapKey(resp.GetStartKey())),
+				zap.Stringer("EndKey", logutil.WrapKey(resp.GetEndKey())))
+			err = respFn(resp)
+			if err != nil {
+				return errors.Trace(err)
+			}
 		}
 	}
 	return nil
 }
 
 // ChecksumMatches tests whether the "local" checksum matches the checksum from TiKV.
-func ChecksumMatches(backupMeta *kvproto.BackupMeta, local []Checksum) (bool, error) {
+func ChecksumMatches(backupMeta *kvproto.BackupMeta, local []Checksum) error {
 	if len(local) != len(backupMeta.Schemas) {
-		return false, nil
+		return errors.Annotatef(berrors.ErrBackupChecksumMismatch,
+			"checksum mismatch, checksum len %d, schema len %d", len(local), len(backupMeta.Schemas))
 	}
 
 	for i, schema := range backupMeta.Schemas {
@@ -843,19 +934,17 @@ func ChecksumMatches(backupMeta *kvproto.BackupMeta, local []Checksum) (bool, er
 		dbInfo := &model.DBInfo{}
 		err := json.Unmarshal(schema.Db, dbInfo)
 		if err != nil {
-			log.Error("failed in fast checksum, and cannot parse db info.")
-			return false, err
+			return errors.Annotate(berrors.ErrBackupChecksumMismatch, "failed in checksum, and cannot parse db info")
 		}
 		tblInfo := &model.TableInfo{}
 		err = json.Unmarshal(schema.Table, tblInfo)
 		if err != nil {
-			log.Error("failed in fast checksum, and cannot parse table info.")
-			return false, err
+			return errors.Annotate(berrors.ErrBackupChecksumMismatch, "failed in checksum, and cannot parse table info")
 		}
 		if localChecksum.Crc64Xor != schema.Crc64Xor ||
 			localChecksum.TotalBytes != schema.TotalBytes ||
 			localChecksum.TotalKvs != schema.TotalKvs {
-			log.Error("failed in fast checksum",
+			log.Error("checksum mismatch",
 				zap.Stringer("db", dbInfo.Name),
 				zap.Stringer("table", tblInfo.Name),
 				zap.Uint64("origin tidb crc64", schema.Crc64Xor),
@@ -863,15 +952,15 @@ func ChecksumMatches(backupMeta *kvproto.BackupMeta, local []Checksum) (bool, er
 				zap.Uint64("origin tidb total kvs", schema.TotalKvs),
 				zap.Uint64("calculated total kvs", localChecksum.TotalKvs),
 				zap.Uint64("origin tidb total bytes", schema.TotalBytes),
-				zap.Uint64("calculated total bytes", localChecksum.TotalBytes),
-			)
-			return false, nil
+				zap.Uint64("calculated total bytes", localChecksum.TotalBytes))
+			// TODO enhance error
+			return errors.Annotate(berrors.ErrBackupChecksumMismatch, "failed in checksum, and cannot parse table info")
 		}
-		log.Info("fast checksum success",
+		log.Info("checksum success",
 			zap.String("database", dbInfo.Name.L),
 			zap.String("table", tblInfo.Name.L))
 	}
-	return true, nil
+	return nil
 }
 
 // collectFileInfo collects ungrouped file summary information, like kv count and size.
@@ -893,7 +982,7 @@ func CollectChecksums(backupMeta *kvproto.BackupMeta) ([]Checksum, error) {
 
 	dbs, err := utils.LoadBackupTables(backupMeta)
 	if err != nil {
-		return nil, err
+		return nil, errors.Trace(err)
 	}
 
 	checksums := make([]Checksum, 0, len(backupMeta.Schemas))
@@ -901,12 +990,12 @@ func CollectChecksums(backupMeta *kvproto.BackupMeta) ([]Checksum, error) {
 		dbInfo := &model.DBInfo{}
 		err = json.Unmarshal(schema.Db, dbInfo)
 		if err != nil {
-			return nil, err
+			return nil, errors.Trace(err)
 		}
 		tblInfo := &model.TableInfo{}
 		err = json.Unmarshal(schema.Table, tblInfo)
 		if err != nil {
-			return nil, err
+			return nil, errors.Trace(err)
 		}
 		tbl := dbs[dbInfo.Name.String()].GetTable(tblInfo.Name.String())
 
@@ -919,8 +1008,6 @@ func CollectChecksums(backupMeta *kvproto.BackupMeta) ([]Checksum, error) {
 			totalBytes += file.TotalBytes
 		}
 
-		summary.CollectSuccessUnit(summary.TotalKV, 1, totalKvs)
-		summary.CollectSuccessUnit(summary.TotalBytes, 1, totalBytes)
 		log.Info("fast checksum calculated", zap.Stringer("db", dbInfo.Name), zap.Stringer("table", tblInfo.Name))
 		localChecksum := Checksum{
 			Crc64Xor:   checksum,
@@ -933,31 +1020,7 @@ func CollectChecksums(backupMeta *kvproto.BackupMeta) ([]Checksum, error) {
 	return checksums, nil
 }
 
-// FilterSchema filter in-place schemas that doesn't have backup files
-// this is useful during incremental backup, no files in backup means no files to restore
-// so we can skip some DDL in restore to speed up restoration.
-func FilterSchema(backupMeta *kvproto.BackupMeta) error {
-	dbs, err := utils.LoadBackupTables(backupMeta)
-	if err != nil {
-		return err
-	}
-	schemas := make([]*kvproto.Schema, 0, len(backupMeta.Schemas))
-	for _, schema := range backupMeta.Schemas {
-		dbInfo := &model.DBInfo{}
-		err := json.Unmarshal(schema.Db, dbInfo)
-		if err != nil {
-			return err
-		}
-		tblInfo := &model.TableInfo{}
-		err = json.Unmarshal(schema.Table, tblInfo)
-		if err != nil {
-			return err
-		}
-		tbl := dbs[dbInfo.Name.String()].GetTable(tblInfo.Name.String())
-		if len(tbl.Files) > 0 {
-			schemas = append(schemas, schema)
-		}
-	}
-	backupMeta.Schemas = schemas
-	return nil
+// isRetryableError represents whether we should retry reset grpc connection.
+func isRetryableError(err error) bool {
+	return status.Code(err) == codes.Unavailable || status.Code(err) == codes.Canceled
 }

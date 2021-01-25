@@ -4,12 +4,15 @@ package storage
 
 import (
 	"net/url"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/backup"
+
+	berrors "github.com/pingcap/br/pkg/errors"
 )
 
 // BackendOptions further configures the storage backend not expressed by the
@@ -19,20 +22,37 @@ type BackendOptions struct {
 	GCS GCSBackendOptions `json:"gcs" toml:"gcs"`
 }
 
+// ParseRawURL parse raw url to url object.
+func ParseRawURL(rawURL string) (*url.URL, error) {
+	// https://github.com/pingcap/br/issues/603
+	// In aws the secret key may contain '/+=' and '+' has a special meaning in URL.
+	// Replace "+" by "%2B" here to avoid this problem.
+	rawURL = strings.ReplaceAll(rawURL, "+", "%2B")
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return u, nil
+}
+
 // ParseBackend constructs a structured backend description from the
 // storage URL.
 func ParseBackend(rawURL string, options *BackendOptions) (*backup.StorageBackend, error) {
 	if len(rawURL) == 0 {
-		return nil, errors.New("empty store is not allowed")
+		return nil, errors.Annotate(berrors.ErrStorageInvalidConfig, "empty store is not allowed")
 	}
-
-	u, err := url.Parse(rawURL)
+	u, err := ParseRawURL(rawURL)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	switch u.Scheme {
 	case "":
-		return nil, errors.Errorf("please specify the storage type (e.g. --storage 'local://%s')", u.Path)
+		absPath, err := filepath.Abs(rawURL)
+		if err != nil {
+			return nil, errors.Annotatef(berrors.ErrStorageInvalidConfig, "covert data-source-dir '%s' to absolute path failed", rawURL)
+		}
+		local := &backup.Local{Path: absPath}
+		return &backup.StorageBackend{Backend: &backup.StorageBackend_Local{Local: local}}, nil
 
 	case "local", "file":
 		local := &backup.Local{Path: u.Path}
@@ -44,7 +64,7 @@ func ParseBackend(rawURL string, options *BackendOptions) (*backup.StorageBacken
 
 	case "s3":
 		if u.Host == "" {
-			return nil, errors.Errorf("please specify the bucket for s3 in %s", rawURL)
+			return nil, errors.Annotatef(berrors.ErrStorageInvalidConfig, "please specify the bucket for s3 in %s", rawURL)
 		}
 		prefix := strings.Trim(u.Path, "/")
 		s3 := &backup.S3{Bucket: u.Host, Prefix: prefix}
@@ -52,24 +72,28 @@ func ParseBackend(rawURL string, options *BackendOptions) (*backup.StorageBacken
 			options = &BackendOptions{}
 		}
 		ExtractQueryParameters(u, &options.S3)
-		if err := options.S3.apply(s3); err != nil {
-			return nil, err
+		if err := options.S3.Apply(s3); err != nil {
+			return nil, errors.Trace(err)
 		}
 		return &backup.StorageBackend{Backend: &backup.StorageBackend_S3{S3: s3}}, nil
 
 	case "gs", "gcs":
-		gcs := &backup.GCS{Bucket: u.Host, Prefix: u.Path[1:]}
+		if u.Host == "" {
+			return nil, errors.Annotatef(berrors.ErrStorageInvalidConfig, "please specify the bucket for gcs in %s", rawURL)
+		}
+		prefix := strings.Trim(u.Path, "/")
+		gcs := &backup.GCS{Bucket: u.Host, Prefix: prefix}
 		if options == nil {
 			options = &BackendOptions{}
 		}
 		ExtractQueryParameters(u, &options.GCS)
 		if err := options.GCS.apply(gcs); err != nil {
-			return nil, err
+			return nil, errors.Trace(err)
 		}
 		return &backup.StorageBackend{Backend: &backup.StorageBackend_Gcs{Gcs: gcs}}, nil
 
 	default:
-		return nil, errors.Errorf("storage %s not support yet", u.Scheme)
+		return nil, errors.Annotatef(berrors.ErrStorageInvalidConfig, "storage %s not support yet", u.Scheme)
 	}
 }
 

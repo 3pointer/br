@@ -13,21 +13,21 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/backup"
 	"github.com/pingcap/kvproto/pkg/import_sstpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/log"
 	"github.com/pingcap/parser/model"
-	pd "github.com/pingcap/pd/v4/client"
-	"github.com/pingcap/pd/v4/server/schedule/placement"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/statistics/handle"
 	"github.com/pingcap/tidb/store/tikv/oracle"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/util/codec"
-	"go.uber.org/multierr"
+	pd "github.com/tikv/pd/client"
+	"github.com/tikv/pd/server/schedule/placement"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -37,7 +37,10 @@ import (
 
 	"github.com/pingcap/br/pkg/checksum"
 	"github.com/pingcap/br/pkg/conn"
+	berrors "github.com/pingcap/br/pkg/errors"
 	"github.com/pingcap/br/pkg/glue"
+	"github.com/pingcap/br/pkg/logutil"
+	"github.com/pingcap/br/pkg/pdutil"
 	"github.com/pingcap/br/pkg/storage"
 	"github.com/pingcap/br/pkg/summary"
 	"github.com/pingcap/br/pkg/utils"
@@ -49,14 +52,12 @@ const defaultChecksumConcurrency = 64
 
 // Client sends requests to restore files.
 type Client struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	pdClient     pd.Client
-	toolClient   SplitClient
-	fileImporter FileImporter
-	workerPool   *utils.WorkerPool
-	tlsConf      *tls.Config
+	pdClient      pd.Client
+	toolClient    SplitClient
+	fileImporter  FileImporter
+	workerPool    *utils.WorkerPool
+	tlsConf       *tls.Config
+	keepaliveConf keepalive.ClientParameters
 
 	databases  map[string]*utils.Database
 	ddlJobs    []*model.Job
@@ -64,56 +65,64 @@ type Client struct {
 	// TODO Remove this field or replace it with a []*DB,
 	// since https://github.com/pingcap/br/pull/377 needs more DBs to speed up DDL execution.
 	// And for now, we must inject a pool of DBs to `Client.GoCreateTables`, otherwise there would be a race condition.
-	// Which is dirty: why we need DBs from different sources?
+	// This is dirty: why we need DBs from different sources?
 	// By replace it with a []*DB, we can remove the dirty parameter of `Client.GoCreateTable`,
 	// along with them in some private functions.
 	// Before you do it, you can firstly read discussions at
 	// https://github.com/pingcap/br/pull/377#discussion_r446594501,
-	// this probably isn't as easy and it seems like (however, not hard, too :D)
+	// this probably isn't as easy as it seems like (however, not hard, too :D)
 	db              *DB
 	rateLimit       uint64
 	isOnline        bool
 	noSchema        bool
 	hasSpeedLimited bool
-	// Those fields should be removed after we have FULLY supportted TiFlash.
-	// we place this field here to make a 'good' memory align, but mainly make golang-ci happy :)
-	tiFlashRecordUpdated bool
 
 	restoreStores []uint64
-
-	// tables that has TiFlash and those TiFlash have been removed, should be written to disk.
-	// Those fields should be removed after we have FULLY supportted TiFlash.
-	tablesRemovedTiFlash []*backup.Schema
 
 	storage            storage.ExternalStorage
 	backend            *backup.StorageBackend
 	switchModeInterval time.Duration
 	switchCh           chan struct{}
+
+	// statHandler and dom are used for analyze table after restore.
+	// it will backup stats with #dump.DumpStatsToJSON
+	// and restore stats with #dump.LoadStatsFromJSON
+	statsHandler *handle.Handle
+	dom          *domain.Domain
 }
 
 // NewRestoreClient returns a new RestoreClient.
 func NewRestoreClient(
-	ctx context.Context,
 	g glue.Glue,
 	pdClient pd.Client,
 	store kv.Storage,
 	tlsConf *tls.Config,
+	keepaliveConf keepalive.ClientParameters,
 ) (*Client, error) {
-	ctx, cancel := context.WithCancel(ctx)
 	db, err := NewDB(g, store)
 	if err != nil {
-		cancel()
+		return nil, errors.Trace(err)
+	}
+	dom, err := g.GetDomain(store)
+	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
+	var statsHandle *handle.Handle
+	// tikv.Glue will return nil, tidb.Glue will return available domain
+	if dom != nil {
+		statsHandle = dom.StatsHandle()
+	}
+
 	return &Client{
-		ctx:        ctx,
-		cancel:     cancel,
-		pdClient:   pdClient,
-		toolClient: NewSplitClient(pdClient, tlsConf),
-		db:         db,
-		tlsConf:    tlsConf,
-		switchCh:   make(chan struct{}),
+		pdClient:      pdClient,
+		toolClient:    NewSplitClient(pdClient, tlsConf),
+		db:            db,
+		tlsConf:       tlsConf,
+		keepaliveConf: keepaliveConf,
+		switchCh:      make(chan struct{}),
+		dom:           dom,
+		statsHandler:  statsHandle,
 	}, nil
 }
 
@@ -127,7 +136,7 @@ func (rc *Client) SetStorage(ctx context.Context, backend *backup.StorageBackend
 	var err error
 	rc.storage, err = storage.Create(ctx, backend, sendCreds)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	rc.backend = backend
 	return nil
@@ -154,7 +163,6 @@ func (rc *Client) Close() {
 	if rc.db != nil {
 		rc.db.Close()
 	}
-	rc.cancel()
 	log.Info("Restore client closed")
 }
 
@@ -178,8 +186,9 @@ func (rc *Client) InitBackupMeta(backupMeta *backup.BackupMeta, backend *backup.
 	log.Info("load backupmeta", zap.Int("databases", len(rc.databases)), zap.Int("jobs", len(rc.ddlJobs)))
 
 	metaClient := NewSplitClient(rc.pdClient, rc.tlsConf)
-	importClient := NewImportClient(metaClient, rc.tlsConf)
-	rc.fileImporter = NewFileImporter(metaClient, importClient, backend, backupMeta.IsRawKv, rc.rateLimit)
+	importCli := NewImportClient(metaClient, rc.tlsConf, rc.keepaliveConf)
+	rc.fileImporter = NewFileImporter(metaClient, importCli, backend, rc.backupMeta.IsRawKv, rc.rateLimit)
+
 	return nil
 }
 
@@ -191,7 +200,7 @@ func (rc *Client) IsRawKvMode() bool {
 // GetFilesInRawRange gets all files that are in the given range or intersects with the given range.
 func (rc *Client) GetFilesInRawRange(startKey []byte, endKey []byte, cf string) ([]*backup.File, error) {
 	if !rc.IsRawKvMode() {
-		return nil, errors.New("the backup data is not in raw kv mode")
+		return nil, errors.Annotate(berrors.ErrRestoreModeMismatch, "the backup data is not in raw kv mode")
 	}
 
 	for _, rawRange := range rc.backupMeta.RawRanges {
@@ -210,7 +219,7 @@ func (rc *Client) GetFilesInRawRange(startKey []byte, endKey []byte, cf string) 
 			utils.CompareEndKey(endKey, rawRange.EndKey) > 0 {
 			// Only partial of the restoring range is in the current backup-ed range. So the given range can't be fully
 			// restored.
-			return nil, errors.New("the given range to restore is not fully covered by the range that was backed up")
+			return nil, errors.Annotate(berrors.ErrRestoreRangeMismatch, "the given range to restore is not fully covered by the range that was backed up")
 		}
 
 		// We have found the range that contains the given range. Find all necessary files.
@@ -238,7 +247,7 @@ func (rc *Client) GetFilesInRawRange(startKey []byte, endKey []byte, cf string) 
 		return files, nil
 	}
 
-	return nil, errors.New("no backup data in the range")
+	return nil, errors.Annotate(berrors.ErrRestoreRangeMismatch, "no backup data in the range")
 }
 
 // SetConcurrency sets the concurrency of dbs tables files.
@@ -267,29 +276,29 @@ func (rc *Client) GetTS(ctx context.Context) (uint64, error) {
 }
 
 // ResetTS resets the timestamp of PD to a bigger value.
-func (rc *Client) ResetTS(pdAddrs []string) error {
+func (rc *Client) ResetTS(ctx context.Context, pdAddrs []string) error {
 	restoreTS := rc.backupMeta.GetEndVersion()
 	log.Info("reset pd timestamp", zap.Uint64("ts", restoreTS))
 	i := 0
-	return utils.WithRetry(rc.ctx, func() error {
+	return utils.WithRetry(ctx, func() error {
 		idx := i % len(pdAddrs)
 		i++
-		return utils.ResetTS(pdAddrs[idx], restoreTS, rc.tlsConf)
+		return pdutil.ResetTS(ctx, pdAddrs[idx], restoreTS, rc.tlsConf)
 	}, newPDReqBackoffer())
 }
 
 // GetPlacementRules return the current placement rules.
-func (rc *Client) GetPlacementRules(pdAddrs []string) ([]placement.Rule, error) {
+func (rc *Client) GetPlacementRules(ctx context.Context, pdAddrs []string) ([]placement.Rule, error) {
 	var placementRules []placement.Rule
 	i := 0
-	errRetry := utils.WithRetry(rc.ctx, func() error {
+	errRetry := utils.WithRetry(ctx, func() error {
 		var err error
 		idx := i % len(pdAddrs)
 		i++
-		placementRules, err = utils.GetPlacementRules(pdAddrs[idx], rc.tlsConf)
-		return err
+		placementRules, err = pdutil.GetPlacementRules(ctx, pdAddrs[idx], rc.tlsConf)
+		return errors.Trace(err)
 	}, newPDReqBackoffer())
-	return placementRules, errRetry
+	return placementRules, errors.Trace(errRetry)
 }
 
 // GetDatabases returns all databases.
@@ -326,12 +335,12 @@ func (rc *Client) GetTableSchema(
 }
 
 // CreateDatabase creates a database.
-func (rc *Client) CreateDatabase(db *model.DBInfo) error {
+func (rc *Client) CreateDatabase(ctx context.Context, db *model.DBInfo) error {
 	if rc.IsSkipCreateSQL() {
 		log.Info("skip create database", zap.Stringer("database", db.Name))
 		return nil
 	}
-	return rc.db.CreateDatabase(rc.ctx, db)
+	return rc.db.CreateDatabase(ctx, db)
 }
 
 // CreateTables creates multiple tables, and returns their rewrite rules.
@@ -365,7 +374,7 @@ func (rc *Client) CreateTables(
 	select {
 	case err, ok := <-errCh:
 		if ok {
-			return nil, nil, err
+			return nil, nil, errors.Trace(err)
 		}
 	default:
 	}
@@ -382,17 +391,21 @@ func (rc *Client) createTable(
 	if rc.IsSkipCreateSQL() {
 		log.Info("skip create table and alter autoIncID", zap.Stringer("table", table.Info.Name))
 	} else {
-		// don't use rc.ctx here...
-		// remove the ctx field of Client would be a great work,
-		// we just take a small step here :<
 		err := db.CreateTable(ctx, table)
 		if err != nil {
-			return CreatedTable{}, err
+			return CreatedTable{}, errors.Trace(err)
 		}
 	}
-	newTableInfo, err := rc.GetTableSchema(dom, table.Db.Name, table.Info.Name)
+	newTableInfo, err := rc.GetTableSchema(dom, table.DB.Name, table.Info.Name)
 	if err != nil {
-		return CreatedTable{}, err
+		return CreatedTable{}, errors.Trace(err)
+	}
+	if newTableInfo.IsCommonHandle != table.Info.IsCommonHandle {
+		return CreatedTable{}, errors.Annotatef(berrors.ErrRestoreModeMismatch,
+			"Clustered index option mismatch. Restored cluster's @@tidb_enable_clustered_index should be %v (backup table = %v, created table = %v).",
+			transferBoolToValue(table.Info.IsCommonHandle),
+			table.Info.IsCommonHandle,
+			newTableInfo.IsCommonHandle)
 	}
 	rules := GetRewriteRules(newTableInfo, table.Info, newTS)
 	et := CreatedTable{
@@ -416,6 +429,13 @@ func (rc *Client) GoCreateTables(
 ) <-chan CreatedTable {
 	// Could we have a smaller size of tables?
 	log.Info("start create tables")
+
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("Client.GoCreateTables", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
+	}
+
 	outCh := make(chan CreatedTable, len(tables))
 	createOneTable := func(c context.Context, db *DB, t *utils.Table) error {
 		select {
@@ -427,14 +447,14 @@ func (rc *Client) GoCreateTables(
 		if err != nil {
 			log.Error("create table failed",
 				zap.Error(err),
-				zap.Stringer("db", t.Db.Name),
+				zap.Stringer("db", t.DB.Name),
 				zap.Stringer("table", t.Info.Name))
-			return err
+			return errors.Trace(err)
 		}
 		log.Debug("table created and send to next",
 			zap.Int("output chan size", len(outCh)),
 			zap.Stringer("table", t.Info.Name),
-			zap.Stringer("database", t.Db.Name))
+			zap.Stringer("database", t.DB.Name))
 		outCh <- rt
 		return nil
 	}
@@ -459,7 +479,7 @@ func (rc *Client) createTablesWithSoleDB(ctx context.Context,
 	tables []*utils.Table) error {
 	for _, t := range tables {
 		if err := createOneTable(ctx, rc.db, t); err != nil {
-			return err
+			return errors.Trace(err)
 		}
 	}
 	return nil
@@ -480,116 +500,15 @@ func (rc *Client) createTablesWithDBPool(ctx context.Context,
 	return eg.Wait()
 }
 
-// makeTiFlashOfTableRecord make a 'record' repsenting TiFlash of a table that has been removed.
-// We doesn't record table ID here because when restore TiFlash replicas,
-// we use `ALTER TABLE db.tbl SET TIFLASH_REPLICA = xxx` DDL, instead of use some internal TiDB API.
-func makeTiFlashOfTableRecord(table *utils.Table, replica int) (*backup.Schema, error) {
-	tableData, err := json.Marshal(table.Info)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	dbData, err := json.Marshal(table.Db)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	result := &backup.Schema{
-		Db:              dbData,
-		Table:           tableData,
-		Crc64Xor:        table.Crc64Xor,
-		TotalKvs:        table.TotalKvs,
-		TotalBytes:      table.TotalBytes,
-		TiflashReplicas: uint32(replica),
-	}
-	return result, nil
-}
-
-// RemoveTiFlashOfTable removes TiFlash replica of some table,
-// returns the removed count of TiFlash nodes.
-// TODO: save the removed TiFlash information into disk.
-// TODO: remove this after tiflash supports restore.
-func (rc *Client) RemoveTiFlashOfTable(table CreatedTable, rule []placement.Rule) (int, error) {
-	if rule := utils.SearchPlacementRule(table.Table.ID, rule, placement.Learner); rule != nil {
-		if rule.Count > 0 {
-			log.Info("remove TiFlash of table", zap.Int64("table ID", table.Table.ID), zap.Int("count", rule.Count))
-			err := multierr.Combine(
-				rc.db.AlterTiflashReplica(rc.ctx, table.OldTable, 0),
-				rc.removeTiFlashOf(table.OldTable, rule.Count),
-				rc.flushTiFlashRecord(),
-			)
-			if err != nil {
-				return 0, errors.Trace(err)
-			}
-			return rule.Count, nil
-		}
-	}
-	return 0, nil
-}
-
-func (rc *Client) removeTiFlashOf(table *utils.Table, replica int) error {
-	tableRecord, err := makeTiFlashOfTableRecord(table, replica)
-	if err != nil {
-		return err
-	}
-	rc.tablesRemovedTiFlash = append(rc.tablesRemovedTiFlash, tableRecord)
-	rc.tiFlashRecordUpdated = true
-	return nil
-}
-
-func (rc *Client) flushTiFlashRecord() error {
-	// Today nothing to do :D
-	if !rc.tiFlashRecordUpdated {
-		return nil
-	}
-
-	// should we make a deep copy here?
-	// currently, write things directly to backup meta is OK since there seems nobody uses it.
-	// But would it be better if we don't do it?
-	rc.backupMeta.Schemas = rc.tablesRemovedTiFlash
-	backupMetaData, err := proto.Marshal(rc.backupMeta)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	backendURL := storage.FormatBackendURL(rc.backend)
-	log.Info("update backup meta", zap.Stringer("path", &backendURL))
-	err = rc.storage.Write(rc.ctx, utils.SavedMetaFile, backupMetaData)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	return nil
-}
-
-// RecoverTiFlashOfTable recovers TiFlash replica of some table.
-// TODO: remove this after tiflash supports restore.
-func (rc *Client) RecoverTiFlashOfTable(table *utils.Table) error {
-	if table.TiFlashReplicas > 0 {
-		err := rc.db.AlterTiflashReplica(rc.ctx, table, table.TiFlashReplicas)
-		if err != nil {
-			return errors.Trace(err)
-		}
-	}
-	return nil
-}
-
-// RecoverTiFlashReplica recovers all the tiflash replicas of a table
-// TODO: remove this after tiflash supports restore.
-func (rc *Client) RecoverTiFlashReplica(tables []*utils.Table) error {
-	for _, table := range tables {
-		if err := rc.RecoverTiFlashOfTable(table); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // ExecDDLs executes the queries of the ddl jobs.
-func (rc *Client) ExecDDLs(ddlJobs []*model.Job) error {
+func (rc *Client) ExecDDLs(ctx context.Context, ddlJobs []*model.Job) error {
 	// Sort the ddl jobs by schema version in ascending order.
 	sort.Slice(ddlJobs, func(i, j int) bool {
 		return ddlJobs[i].BinlogInfo.SchemaVersion < ddlJobs[j].BinlogInfo.SchemaVersion
 	})
 
 	for _, job := range ddlJobs {
-		err := rc.db.ExecDDL(rc.ctx, job)
+		err := rc.db.ExecDDL(ctx, job)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -601,16 +520,16 @@ func (rc *Client) ExecDDLs(ddlJobs []*model.Job) error {
 	return nil
 }
 
-func (rc *Client) setSpeedLimit() error {
+func (rc *Client) setSpeedLimit(ctx context.Context) error {
 	if !rc.hasSpeedLimited && rc.rateLimit != 0 {
-		stores, err := conn.GetAllTiKVStores(rc.ctx, rc.pdClient, conn.SkipTiFlash)
+		stores, err := conn.GetAllTiKVStores(ctx, rc.pdClient, conn.SkipTiFlash)
 		if err != nil {
-			return err
+			return errors.Trace(err)
 		}
 		for _, store := range stores {
-			err = rc.fileImporter.setDownloadSpeedLimit(rc.ctx, store.GetId())
+			err = rc.fileImporter.setDownloadSpeedLimit(ctx, store.GetId())
 			if err != nil {
-				return err
+				return errors.Trace(err)
 			}
 		}
 		rc.hasSpeedLimited = true
@@ -620,17 +539,18 @@ func (rc *Client) setSpeedLimit() error {
 
 // RestoreFiles tries to restore the files.
 func (rc *Client) RestoreFiles(
+	ctx context.Context,
 	files []*backup.File,
 	rewriteRules *RewriteRules,
-	rejectStoreMap map[uint64]bool,
 	updateCh glue.Progress,
 ) (err error) {
 	start := time.Now()
 	defer func() {
 		elapsed := time.Since(start)
 		if err == nil {
-			log.Info("Restore Files",
-				zap.Int("files", len(files)), zap.Duration("take", elapsed))
+			log.Info("Restore files",
+				zap.Duration("take", elapsed),
+				logutil.Files(files))
 			summary.CollectSuccessUnit("files", len(files), elapsed)
 		}
 	}()
@@ -638,18 +558,30 @@ func (rc *Client) RestoreFiles(
 	log.Debug("start to restore files",
 		zap.Int("files", len(files)),
 	)
-	eg, ectx := errgroup.WithContext(rc.ctx)
-	err = rc.setSpeedLimit()
+
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("Client.RestoreFiles", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
+	}
+
+	eg, ectx := errgroup.WithContext(ctx)
+	err = rc.setSpeedLimit(ctx)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 
 	for _, file := range files {
 		fileReplica := file
 		rc.workerPool.ApplyOnErrorGroup(eg,
 			func() error {
-				defer updateCh.Inc()
-				return rc.fileImporter.Import(ectx, fileReplica, rejectStoreMap, rewriteRules)
+				fileStart := time.Now()
+				defer func() {
+					log.Info("import file done", logutil.File(fileReplica),
+						zap.Duration("take", time.Since(fileStart)))
+					updateCh.Inc()
+				}()
+				return rc.fileImporter.Import(ectx, fileReplica, rewriteRules)
 			})
 	}
 	if err := eg.Wait(); err != nil {
@@ -658,23 +590,25 @@ func (rc *Client) RestoreFiles(
 			"restore files failed",
 			zap.Error(err),
 		)
-		return err
+		return errors.Trace(err)
 	}
 	return nil
 }
 
 // RestoreRaw tries to restore raw keys in the specified range.
-func (rc *Client) RestoreRaw(startKey []byte, endKey []byte, files []*backup.File, updateCh glue.Progress) error {
+func (rc *Client) RestoreRaw(
+	ctx context.Context, startKey []byte, endKey []byte, files []*backup.File, updateCh glue.Progress,
+) error {
 	start := time.Now()
 	defer func() {
 		elapsed := time.Since(start)
 		log.Info("Restore Raw",
-			zap.String("startKey", hex.EncodeToString(startKey)),
-			zap.String("endKey", hex.EncodeToString(endKey)),
+			zap.Stringer("startKey", logutil.WrapKey(startKey)),
+			zap.Stringer("endKey", logutil.WrapKey(endKey)),
 			zap.Duration("take", elapsed))
 	}()
 	errCh := make(chan error, len(files))
-	eg, ectx := errgroup.WithContext(rc.ctx)
+	eg, ectx := errgroup.WithContext(ctx)
 	defer close(errCh)
 
 	err := rc.fileImporter.SetRawRange(startKey, endKey)
@@ -682,28 +616,27 @@ func (rc *Client) RestoreRaw(startKey []byte, endKey []byte, files []*backup.Fil
 		return errors.Trace(err)
 	}
 
-	emptyRules := &RewriteRules{}
 	for _, file := range files {
 		fileReplica := file
 		rc.workerPool.ApplyOnErrorGroup(eg,
 			func() error {
 				defer updateCh.Inc()
-				return rc.fileImporter.Import(ectx, fileReplica, nil, emptyRules)
+				return rc.fileImporter.Import(ectx, fileReplica, EmptyRewriteRule())
 			})
 	}
 	if err := eg.Wait(); err != nil {
 		log.Error(
 			"restore raw range failed",
-			zap.String("startKey", hex.EncodeToString(startKey)),
-			zap.String("endKey", hex.EncodeToString(endKey)),
+			zap.Stringer("startKey", logutil.WrapKey(startKey)),
+			zap.Stringer("endKey", logutil.WrapKey(endKey)),
 			zap.Error(err),
 		)
-		return err
+		return errors.Trace(err)
 	}
 	log.Info(
 		"finish to restore raw range",
-		zap.String("startKey", hex.EncodeToString(startKey)),
-		zap.String("endKey", hex.EncodeToString(endKey)),
+		zap.Stringer("startKey", logutil.WrapKey(startKey)),
+		zap.Stringer("endKey", logutil.WrapKey(endKey)),
 	)
 	return nil
 }
@@ -714,6 +647,14 @@ func (rc *Client) SwitchToImportMode(ctx context.Context) {
 	// so we need ping tikv in less than 10 minute
 	go func() {
 		tick := time.NewTicker(rc.switchModeInterval)
+		defer tick.Stop()
+
+		// [important!] switch tikv mode into import at the beginning
+		log.Info("switch to import mode at beginning")
+		err := rc.switchTiKVMode(ctx, import_sstpb.SwitchMode_Import)
+		if err != nil {
+			log.Warn("switch to import mode failed", zap.Error(err))
+		}
 
 		for {
 			select {
@@ -752,17 +693,13 @@ func (rc *Client) switchTiKVMode(ctx context.Context, mode import_sstpb.SwitchMo
 			opt = grpc.WithTransportCredentials(credentials.NewTLS(rc.tlsConf))
 		}
 		gctx, cancel := context.WithTimeout(ctx, time.Second*5)
-		keepAlive := 10
-		keepAliveTimeout := 3
 		conn, err := grpc.DialContext(
 			gctx,
 			store.GetAddress(),
 			opt,
 			grpc.WithConnectParams(grpc.ConnectParams{Backoff: bfConf}),
-			grpc.WithKeepaliveParams(keepalive.ClientParameters{
-				Time:    time.Duration(keepAlive) * time.Second,
-				Timeout: time.Duration(keepAliveTimeout) * time.Second,
-			}),
+			// we don't need to set keepalive timeout here, because the connection lives
+			// at most 5s. (shorter than minimal value for keepalive time!)
 		)
 		cancel()
 		if err != nil {
@@ -792,6 +729,7 @@ func (rc *Client) GoValidateChecksum(
 	kvClient kv.Client,
 	errCh chan<- error,
 	updateCh glue.Progress,
+	concurrency uint,
 ) <-chan struct{} {
 	log.Info("Start to validate checksum")
 	outCh := make(chan struct{}, 1)
@@ -806,6 +744,7 @@ func (rc *Client) GoValidateChecksum(
 			}
 			elapsed := time.Since(start)
 			summary.CollectDuration("restore checksum", elapsed)
+			summary.CollectSuccessUnit("table checksum", 1, elapsed)
 			outCh <- struct{}{}
 			close(outCh)
 		}()
@@ -819,9 +758,9 @@ func (rc *Client) GoValidateChecksum(
 					return
 				}
 				workers.ApplyOnErrorGroup(wg, func() error {
-					err := rc.execChecksum(ectx, tbl, kvClient)
+					err := rc.execChecksum(ectx, tbl, kvClient, concurrency)
 					if err != nil {
-						return err
+						return errors.Trace(err)
 					}
 					updateCh.Inc()
 					return nil
@@ -832,13 +771,21 @@ func (rc *Client) GoValidateChecksum(
 	return outCh
 }
 
-func (rc *Client) execChecksum(ctx context.Context, tbl CreatedTable, kvClient kv.Client) error {
+func (rc *Client) execChecksum(ctx context.Context, tbl CreatedTable, kvClient kv.Client, concurrency uint) error {
+	logger := log.With(
+		zap.String("db", tbl.OldTable.DB.Name.O),
+		zap.String("table", tbl.OldTable.Info.Name.O),
+	)
+
 	if tbl.OldTable.NoChecksum() {
-		log.Warn("table has no checksum, skipping checksum",
-			zap.Stringer("table", tbl.OldTable.Info.Name),
-			zap.Stringer("database", tbl.OldTable.Db.Name),
-		)
+		logger.Warn("table has no checksum, skipping checksum")
 		return nil
+	}
+
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("Client.execChecksum", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
 	}
 
 	startTS, err := rc.GetTS(ctx)
@@ -847,6 +794,7 @@ func (rc *Client) execChecksum(ctx context.Context, tbl CreatedTable, kvClient k
 	}
 	exe, err := checksum.NewExecutorBuilder(tbl.Table, startTS).
 		SetOldTable(tbl.OldTable).
+		SetConcurrency(concurrency).
 		Build()
 	if err != nil {
 		return errors.Trace(err)
@@ -862,9 +810,7 @@ func (rc *Client) execChecksum(ctx context.Context, tbl CreatedTable, kvClient k
 	if checksumResp.Checksum != table.Crc64Xor ||
 		checksumResp.TotalKvs != table.TotalKvs ||
 		checksumResp.TotalBytes != table.TotalBytes {
-		log.Error("failed in validate checksum",
-			zap.String("database", table.Db.Name.L),
-			zap.String("table", table.Info.Name.L),
+		logger.Error("failed in validate checksum",
 			zap.Uint64("origin tidb crc64", table.Crc64Xor),
 			zap.Uint64("calculated crc64", checksumResp.Checksum),
 			zap.Uint64("origin tidb total kvs", table.TotalKvs),
@@ -872,7 +818,16 @@ func (rc *Client) execChecksum(ctx context.Context, tbl CreatedTable, kvClient k
 			zap.Uint64("origin tidb total bytes", table.TotalBytes),
 			zap.Uint64("calculated total bytes", checksumResp.TotalBytes),
 		)
-		return errors.New("failed to validate checksum")
+		return errors.Annotate(berrors.ErrRestoreChecksumMismatch, "failed to validate checksum")
+	}
+	if table.Stats != nil {
+		logger.Info("start loads analyze after validate checksum",
+			zap.Int64("old id", tbl.OldTable.Info.ID),
+			zap.Int64("new id", tbl.Table.ID),
+		)
+		if err := rc.statsHandler.LoadStatsFromJSON(rc.dom.InfoSchema(), table.Stats); err != nil {
+			logger.Error("analyze table failed", zap.Any("table", table.Stats), zap.Error(err))
+		}
 	}
 	return nil
 }
@@ -887,10 +842,15 @@ func (rc *Client) LoadRestoreStores(ctx context.Context) error {
 	if !rc.isOnline {
 		return nil
 	}
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("Client.LoadRestoreStores", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
+	}
 
 	stores, err := rc.pdClient.GetAllStores(ctx)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	for _, s := range stores {
 		if s.GetState() != metapb.StoreState_Up {
@@ -924,7 +884,7 @@ func (rc *Client) SetupPlacementRules(ctx context.Context, tables []*model.Table
 	log.Info("start setting placement rules")
 	rule, err := rc.toolClient.GetPlacementRule(ctx, "pd", "default")
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	rule.Index = 100
 	rule.Override = true
@@ -939,7 +899,7 @@ func (rc *Client) SetupPlacementRules(ctx context.Context, tables []*model.Table
 		rule.EndKeyHex = hex.EncodeToString(codec.EncodeBytes([]byte{}, tablecodec.EncodeTablePrefix(t.ID+1)))
 		err = rc.toolClient.SetPlacementRule(ctx, rule)
 		if err != nil {
-			return err
+			return errors.Trace(err)
 		}
 	}
 	log.Info("finish setting placement rules")
@@ -959,7 +919,7 @@ func (rc *Client) WaitPlacementSchedule(ctx context.Context, tables []*model.Tab
 		case <-ticker.C:
 			ok, progress, err := rc.checkRegions(ctx, tables)
 			if err != nil {
-				return err
+				return errors.Trace(err)
 			}
 			if ok {
 				log.Info("finish waiting placement schedule")
@@ -978,7 +938,7 @@ func (rc *Client) checkRegions(ctx context.Context, tables []*model.TableInfo) (
 		end := codec.EncodeBytes([]byte{}, tablecodec.EncodeTablePrefix(t.ID+1))
 		ok, regionProgress, err := rc.checkRange(ctx, start, end)
 		if err != nil {
-			return false, "", err
+			return false, "", errors.Trace(err)
 		}
 		if !ok {
 			return false, fmt.Sprintf("table %v/%v, %s", i, len(tables), regionProgress), nil
@@ -990,7 +950,7 @@ func (rc *Client) checkRegions(ctx context.Context, tables []*model.TableInfo) (
 func (rc *Client) checkRange(ctx context.Context, start, end []byte) (bool, string, error) {
 	regions, err := rc.toolClient.ScanRegions(ctx, start, end, -1)
 	if err != nil {
-		return false, "", err
+		return false, "", errors.Trace(err)
 	}
 	for i, r := range regions {
 	NEXT_PEER:
@@ -1021,7 +981,7 @@ func (rc *Client) ResetPlacementRules(ctx context.Context, tables []*model.Table
 		}
 	}
 	if len(failedTables) > 0 {
-		return errors.Errorf("failed to delete placement rules for tables %v", failedTables)
+		return errors.Annotatef(berrors.ErrPDInvalidResponse, "failed to delete placement rules for tables %v", failedTables)
 	}
 	return nil
 }
@@ -1044,4 +1004,51 @@ func (rc *Client) EnableSkipCreateSQL() {
 // IsSkipCreateSQL returns whether we need skip create schema and tables in restore.
 func (rc *Client) IsSkipCreateSQL() bool {
 	return rc.noSchema
+}
+
+// PreCheckTableClusterIndex checks whether backup tables and existed tables have different cluster index options。
+func (rc *Client) PreCheckTableClusterIndex(
+	tables []*utils.Table,
+	ddlJobs []*model.Job,
+	dom *domain.Domain,
+) error {
+	for _, table := range tables {
+		oldTableInfo, err := rc.GetTableSchema(dom, table.DB.Name, table.Info.Name)
+		// table exists in database
+		if err == nil {
+			if table.Info.IsCommonHandle != oldTableInfo.IsCommonHandle {
+				return errors.Annotatef(berrors.ErrRestoreModeMismatch,
+					"Clustered index option mismatch. Restored cluster's @@tidb_enable_clustered_index should be %v (backup table = %v, created table = %v).",
+					transferBoolToValue(table.Info.IsCommonHandle),
+					table.Info.IsCommonHandle,
+					oldTableInfo.IsCommonHandle)
+			}
+		}
+	}
+	for _, job := range ddlJobs {
+		if job.Type == model.ActionCreateTable {
+			tableInfo := job.BinlogInfo.TableInfo
+			if tableInfo != nil {
+				oldTableInfo, err := rc.GetTableSchema(dom, model.NewCIStr(job.SchemaName), tableInfo.Name)
+				// table exists in database
+				if err == nil {
+					if tableInfo.IsCommonHandle != oldTableInfo.IsCommonHandle {
+						return errors.Annotatef(berrors.ErrRestoreModeMismatch,
+							"Clustered index option mismatch. Restored cluster's @@tidb_enable_clustered_index should be %v (backup table = %v, created table = %v).",
+							transferBoolToValue(tableInfo.IsCommonHandle),
+							tableInfo.IsCommonHandle,
+							oldTableInfo.IsCommonHandle)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func transferBoolToValue(enable bool) string {
+	if enable {
+		return "ON"
+	}
+	return "OFF"
 }

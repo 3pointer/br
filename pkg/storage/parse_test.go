@@ -5,6 +5,7 @@ package storage
 import (
 	"io/ioutil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -25,7 +26,7 @@ func (r *testStorageSuite) TestCreateStorage(c *C) {
 	c.Assert(err, ErrorMatches, "parse (.*)1invalid:(.*): first path segment in URL cannot contain colon")
 
 	_, err = ParseBackend("net:storage", nil)
-	c.Assert(err, ErrorMatches, "storage net not support yet")
+	c.Assert(err, ErrorMatches, "storage net not support yet.*")
 
 	s, err := ParseBackend("local:///tmp/storage", nil)
 	c.Assert(err, IsNil)
@@ -40,7 +41,7 @@ func (r *testStorageSuite) TestCreateStorage(c *C) {
 	c.Assert(s.GetNoop(), NotNil)
 
 	_, err = ParseBackend("s3:///bucket/more/prefix/", &BackendOptions{})
-	c.Assert(err, ErrorMatches, `please specify the bucket for s3 in s3:///bucket/more/prefix/`)
+	c.Assert(err, ErrorMatches, `please specify the bucket for s3 in s3:///bucket/more/prefix/.*`)
 
 	s3opt := &BackendOptions{
 		S3: S3BackendOptions{
@@ -67,6 +68,16 @@ func (r *testStorageSuite) TestCreateStorage(c *C) {
 	c.Assert(s3.Sse, Equals, "aws:kms")
 	c.Assert(s3.SseKmsKeyId, Equals, "TestKey")
 
+	// special character in access keys
+	s, err = ParseBackend(`s3://bucket4/prefix/path?access-key=NXN7IPIOSAAKDEEOLMAF&secret-access-key=nREY/7Dt+PaIbYKrKlEEMMF/ExCiJEX=XMLPUANw`, nil)
+	c.Assert(err, IsNil)
+	s3 = s.GetS3()
+	c.Assert(s3, NotNil)
+	c.Assert(s3.Bucket, Equals, "bucket4")
+	c.Assert(s3.Prefix, Equals, "prefix/path")
+	c.Assert(s3.AccessKey, Equals, "NXN7IPIOSAAKDEEOLMAF")
+	c.Assert(s3.SecretAccessKey, Equals, "nREY/7Dt+PaIbYKrKlEEMMF/ExCiJEX=XMLPUANw")
+
 	gcsOpt := &BackendOptions{
 		GCS: GCSBackendOptions{
 			Endpoint: "https://gcs.example.com/",
@@ -77,12 +88,22 @@ func (r *testStorageSuite) TestCreateStorage(c *C) {
 	gcs := s.GetGcs()
 	c.Assert(gcs, NotNil)
 	c.Assert(gcs.Bucket, Equals, "bucket2")
-	c.Assert(gcs.Prefix, Equals, "prefix/")
+	c.Assert(gcs.Prefix, Equals, "prefix")
 	c.Assert(gcs.Endpoint, Equals, "https://gcs.example.com/")
 	c.Assert(gcs.CredentialsBlob, Equals, "")
 
+	s, err = ParseBackend("gcs://bucket2", gcsOpt)
+	c.Assert(err, IsNil)
+	gcs = s.GetGcs()
+	c.Assert(gcs, NotNil)
+	c.Assert(gcs.Bucket, Equals, "bucket2")
+	c.Assert(gcs.Prefix, Equals, "")
+	c.Assert(gcs.Endpoint, Equals, "https://gcs.example.com/")
+	c.Assert(gcs.CredentialsBlob, Equals, "")
+
+	var credFeilPerm os.FileMode = 0o600
 	fakeCredentialsFile := filepath.Join(c.MkDir(), "fakeCredentialsFile")
-	err = ioutil.WriteFile(fakeCredentialsFile, []byte("fakeCredentials"), 0600)
+	err = ioutil.WriteFile(fakeCredentialsFile, []byte("fakeCredentials"), credFeilPerm)
 	c.Assert(err, IsNil)
 
 	gcsOpt.GCS.CredentialsFile = fakeCredentialsFile
@@ -92,19 +113,25 @@ func (r *testStorageSuite) TestCreateStorage(c *C) {
 	gcs = s.GetGcs()
 	c.Assert(gcs, NotNil)
 	c.Assert(gcs.Bucket, Equals, "bucket")
-	c.Assert(gcs.Prefix, Equals, "more/prefix/")
+	c.Assert(gcs.Prefix, Equals, "more/prefix")
 	c.Assert(gcs.Endpoint, Equals, "https://gcs.example.com/")
 	c.Assert(gcs.CredentialsBlob, Equals, "fakeCredentials")
 
-	err = ioutil.WriteFile(fakeCredentialsFile, []byte("fakeCreds2"), 0600)
+	err = ioutil.WriteFile(fakeCredentialsFile, []byte("fakeCreds2"), credFeilPerm)
 	c.Assert(err, IsNil)
 	s, err = ParseBackend("gs://bucket4/backup/?credentials-file="+url.QueryEscape(fakeCredentialsFile), nil)
 	c.Assert(err, IsNil)
 	gcs = s.GetGcs()
 	c.Assert(gcs, NotNil)
 	c.Assert(gcs.Bucket, Equals, "bucket4")
-	c.Assert(gcs.Prefix, Equals, "backup/")
+	c.Assert(gcs.Prefix, Equals, "backup")
 	c.Assert(gcs.CredentialsBlob, Equals, "fakeCreds2")
+
+	s, err = ParseBackend("/test", nil)
+	c.Assert(err, IsNil)
+	local := s.GetLocal()
+	c.Assert(local, NotNil)
+	c.Assert(local.GetPath(), Equals, "/test")
 }
 
 func (r *testStorageSuite) TestFormatBackendURL(c *C) {

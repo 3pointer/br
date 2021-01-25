@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 
+	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/errors"
 	kvproto "github.com/pingcap/kvproto/pkg/backup"
 	"github.com/pingcap/log"
@@ -14,7 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/pingcap/br/pkg/backup"
-	"github.com/pingcap/br/pkg/conn"
+	berrors "github.com/pingcap/br/pkg/errors"
 	"github.com/pingcap/br/pkg/glue"
 	"github.com/pingcap/br/pkg/rtree"
 	"github.com/pingcap/br/pkg/storage"
@@ -58,31 +59,31 @@ func DefineRawBackupFlags(command *cobra.Command) {
 func (cfg *RawKvConfig) ParseFromFlags(flags *pflag.FlagSet) error {
 	format, err := flags.GetString(flagKeyFormat)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	start, err := flags.GetString(flagStartKey)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	cfg.StartKey, err = utils.ParseKey(format, start)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	end, err := flags.GetString(flagEndKey)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	cfg.EndKey, err = utils.ParseKey(format, end)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 
 	if bytes.Compare(cfg.StartKey, cfg.EndKey) >= 0 {
-		return errors.New("endKey must be greater than startKey")
+		return errors.Annotate(berrors.ErrBackupInvalidRange, "endKey must be greater than startKey")
 	}
 	cfg.CF, err = flags.GetString(flagTiKVColumnFamily)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	if err = cfg.Config.ParseFromFlags(flags); err != nil {
 		return errors.Trace(err)
@@ -94,7 +95,7 @@ func (cfg *RawKvConfig) ParseFromFlags(flags *pflag.FlagSet) error {
 func (cfg *RawKvConfig) ParseBackupConfigFromFlags(flags *pflag.FlagSet) error {
 	err := cfg.ParseFromFlags(flags)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 
 	compressionCfg, err := parseCompressionFlags(flags)
@@ -118,26 +119,34 @@ func (cfg *RawKvConfig) ParseBackupConfigFromFlags(flags *pflag.FlagSet) error {
 
 // RunBackupRaw starts a backup task inside the current goroutine.
 func RunBackupRaw(c context.Context, g glue.Glue, cmdName string, cfg *RawKvConfig) error {
+	cfg.adjust()
+
 	defer summary.Summary(cmdName)
 	ctx, cancel := context.WithCancel(c)
 	defer cancel()
 
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("task.RunBackupRaw", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
+	}
+
 	u, err := storage.ParseBackend(cfg.Storage, &cfg.BackendOptions)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
-	mgr, err := newMgr(ctx, g, cfg.PD, cfg.TLS, conn.SkipTiFlash, cfg.CheckRequirements)
+	mgr, err := NewMgr(ctx, g, cfg.PD, cfg.TLS, GetKeepalive(&cfg.Config), cfg.CheckRequirements)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	defer mgr.Close()
 
 	client, err := backup.NewBackupClient(ctx, mgr)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	if err = client.SetStorage(ctx, u, cfg.SendCreds); err != nil {
-		return err
+		return errors.Trace(err)
 	}
 
 	backupRange := rtree.Range{StartKey: cfg.StartKey, EndKey: cfg.EndKey}
@@ -145,19 +154,23 @@ func RunBackupRaw(c context.Context, g glue.Glue, cmdName string, cfg *RawKvConf
 	if cfg.RemoveSchedulers {
 		restore, e := mgr.RemoveSchedulers(ctx)
 		defer func() {
+			if ctx.Err() != nil {
+				log.Warn("context canceled, try shutdown")
+				ctx = context.Background()
+			}
 			if restoreE := restore(ctx); restoreE != nil {
 				log.Warn("failed to restore removed schedulers, you may need to restore them manually", zap.Error(restoreE))
 			}
 		}()
 		if e != nil {
-			return err
+			return errors.Trace(err)
 		}
 	}
 
 	// The number of regions need to backup
 	approximateRegions, err := mgr.GetRegionCount(ctx, backupRange.StartKey, backupRange.EndKey)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 
 	summary.CollectInt("backup total regions", approximateRegions)
@@ -179,7 +192,7 @@ func RunBackupRaw(c context.Context, g glue.Glue, cmdName string, cfg *RawKvConf
 	}
 	files, err := client.BackupRange(ctx, backupRange.StartKey, backupRange.EndKey, req, updateCh)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	// Backup has finished
 	updateCh.Close()
@@ -188,11 +201,11 @@ func RunBackupRaw(c context.Context, g glue.Glue, cmdName string, cfg *RawKvConf
 	rawRanges := []*kvproto.RawRange{{StartKey: backupRange.StartKey, EndKey: backupRange.EndKey, Cf: cfg.CF}}
 	backupMeta, err := backup.BuildBackupMeta(&req, files, rawRanges, nil)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	err = client.SaveBackupMeta(ctx, &backupMeta)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 
 	g.Record("Size", utils.ArchiveSize(&backupMeta))

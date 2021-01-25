@@ -1,6 +1,6 @@
 // Copyright 2020 PingCAP, Inc. Licensed under Apache-2.0.
 
-package utils
+package logutil
 
 import (
 	"encoding/hex"
@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/backup"
 	"github.com/pingcap/kvproto/pkg/import_sstpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
@@ -70,7 +71,7 @@ func (sstMeta zapMarshalSSTMetaMixIn) MarshalLogObject(enc zapcore.ObjectEncoder
 
 	sstUUID, err := uuid.FromBytes(sstMeta.GetUuid())
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	enc.AddString("UUID", sstUUID.String())
 	return nil
@@ -85,9 +86,24 @@ func (keys zapArrayMarshalKeysMixIn) MarshalLogArray(enc zapcore.ArrayEncoder) e
 	return nil
 }
 
+type files []*backup.File
+
+func (fs files) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
+	totalKVs := uint64(0)
+	totalSize := uint64(0)
+	for _, file := range fs {
+		totalKVs += file.GetTotalKvs()
+		totalSize += file.GetTotalBytes()
+	}
+	encoder.AddUint64("totalKVs", totalKVs)
+	encoder.AddUint64("totalBytes", totalSize)
+	encoder.AddInt("totalFileCount", len(fs))
+	return nil
+}
+
 // WrapKey wrap a key as a Stringer that can print proper upper hex format.
 func WrapKey(key []byte) fmt.Stringer {
-	return kv.Key(key)
+	return RedactStringer(kv.Key(key))
 }
 
 // WrapKeys wrap keys as an ArrayMarshaler that can print proper upper hex format.
@@ -95,22 +111,32 @@ func WrapKeys(keys [][]byte) zapcore.ArrayMarshaler {
 	return zapArrayMarshalKeysMixIn(keys)
 }
 
-// ZapRewriteRule make the zap fields for a rewrite rule.
-func ZapRewriteRule(rewriteRule *import_sstpb.RewriteRule) zapcore.Field {
+// RewriteRule make the zap fields for a rewrite rule.
+func RewriteRule(rewriteRule *import_sstpb.RewriteRule) zapcore.Field {
 	return zap.Object("rewriteRule", zapMarshalRewriteRuleMixIn{rewriteRule})
 }
 
-// ZapRegion make the zap fields for a region.
-func ZapRegion(region *metapb.Region) zapcore.Field {
+// Region make the zap fields for a region.
+func Region(region *metapb.Region) zapcore.Field {
 	return zap.Object("region", zapMarshalRegionMixIn{region})
 }
 
-// ZapFile make the zap fields for a file.
-func ZapFile(file *backup.File) zapcore.Field {
+// File make the zap fields for a file.
+func File(file *backup.File) zapcore.Field {
 	return zap.Object("file", zapMarshalFileMixIn{file})
 }
 
-// ZapSSTMeta make the zap fields for a SST meta.
-func ZapSSTMeta(sstMeta *import_sstpb.SSTMeta) zapcore.Field {
+// SSTMeta make the zap fields for a SST meta.
+func SSTMeta(sstMeta *import_sstpb.SSTMeta) zapcore.Field {
 	return zap.Object("sstMeta", zapMarshalSSTMetaMixIn{sstMeta})
+}
+
+// Files make the zap field for a set of file.
+func Files(fs []*backup.File) zapcore.Field {
+	return zap.Object("fs", files(fs))
+}
+
+// ShortError make the zap field to display error without verbose representation (e.g. the stack trace).
+func ShortError(err error) zapcore.Field {
+	return zap.String("error", err.Error())
 }

@@ -30,30 +30,34 @@ type drySender struct {
 	rewriteRules *restore.RewriteRules
 	ranges       []rtree.Range
 	nBatch       int
+
+	sink restore.TableSink
 }
 
-func (d *drySender) RestoreBatch(
-	_ctx context.Context,
-	ranges []rtree.Range,
-	rewriteRules *restore.RewriteRules,
-) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	log.Info("fake restore range", restore.ZapRanges(ranges)...)
-	d.nBatch++
-	d.rewriteRules.Append(*rewriteRules)
-	d.ranges = append(d.ranges, ranges...)
-	return nil
+func (sender *drySender) PutSink(sink restore.TableSink) {
+	sender.sink = sink
 }
 
-func (d *drySender) Close() {}
+func (sender *drySender) RestoreBatch(ranges restore.DrainResult) {
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	log.Info("fake restore range", restore.ZapRanges(ranges.Ranges))
+	sender.nBatch++
+	sender.rewriteRules.Append(*ranges.RewriteRules)
+	sender.ranges = append(sender.ranges, ranges.Ranges...)
+	sender.sink.EmitTables(ranges.BlankTablesAfterSend...)
+}
+
+func (sender *drySender) Close() {
+	sender.sink.Close()
+}
 
 func waitForSend() {
 	time.Sleep(10 * time.Millisecond)
 }
 
-func (d *drySender) Ranges() []rtree.Range {
-	return d.ranges
+func (sender *drySender) Ranges() []rtree.Range {
+	return sender.ranges
 }
 
 func newDrySender() *drySender {
@@ -64,53 +68,73 @@ func newDrySender() *drySender {
 	}
 }
 
-type recordCurrentTableManager map[int64]bool
-
-func newMockManager() recordCurrentTableManager {
-	return make(recordCurrentTableManager)
+type recordCurrentTableManager struct {
+	lock sync.Mutex
+	m    map[int64]bool
 }
 
-func (manager recordCurrentTableManager) Enter(_ context.Context, tables []restore.CreatedTable) error {
+func (manager *recordCurrentTableManager) Close(ctx context.Context) {
+	manager.lock.Lock()
+	defer manager.lock.Unlock()
+	if len(manager.m) > 0 {
+		log.Panic("When closing, there are still some tables doesn't be sent",
+			zap.Any("tables", manager.m))
+	}
+}
+
+func newMockManager() *recordCurrentTableManager {
+	return &recordCurrentTableManager{
+		m: make(map[int64]bool),
+	}
+}
+
+func (manager *recordCurrentTableManager) Enter(_ context.Context, tables []restore.CreatedTable) error {
+	manager.lock.Lock()
+	defer manager.lock.Unlock()
 	for _, t := range tables {
 		log.Info("entering", zap.Int64("table ID", t.Table.ID))
-		manager[t.Table.ID] = true
+		manager.m[t.Table.ID] = true
 	}
 	return nil
 }
 
-func (manager recordCurrentTableManager) Leave(_ context.Context, tables []restore.CreatedTable) error {
+func (manager *recordCurrentTableManager) Leave(_ context.Context, tables []restore.CreatedTable) error {
+	manager.lock.Lock()
+	defer manager.lock.Unlock()
 	for _, t := range tables {
-		if !manager[t.Table.ID] {
+		if !manager.m[t.Table.ID] {
 			return errors.Errorf("Table %d is removed before added", t.Table.ID)
 		}
 		log.Info("leaving", zap.Int64("table ID", t.Table.ID))
-		manager[t.Table.ID] = false
+		delete(manager.m, t.Table.ID)
 	}
 	return nil
 }
 
-func (manager recordCurrentTableManager) Has(tables ...restore.TableWithRange) bool {
+func (manager *recordCurrentTableManager) Has(tables ...restore.TableWithRange) bool {
+	manager.lock.Lock()
+	defer manager.lock.Unlock()
 	ids := make([]int64, 0, len(tables))
-	currentIDs := make([]int64, 0, len(manager))
+	currentIDs := make([]int64, 0, len(manager.m))
 	for _, t := range tables {
 		ids = append(ids, t.Table.ID)
 	}
-	for id, contains := range manager {
+	for id, contains := range manager.m {
 		if contains {
 			currentIDs = append(currentIDs, id)
 		}
 	}
 	log.Info("testing", zap.Int64s("should has ID", ids), zap.Int64s("has ID", currentIDs))
 	for _, i := range ids {
-		if !manager[i] {
+		if !manager.m[i] {
 			return false
 		}
 	}
 	return true
 }
 
-func (d *drySender) HasRewriteRuleOfKey(prefix string) bool {
-	for _, rule := range d.rewriteRules.Table {
+func (sender *drySender) HasRewriteRuleOfKey(prefix string) bool {
+	for _, rule := range sender.rewriteRules.Table {
 		if bytes.Equal([]byte(prefix), rule.OldKeyPrefix) {
 			return true
 		}
@@ -118,21 +142,19 @@ func (d *drySender) HasRewriteRuleOfKey(prefix string) bool {
 	return false
 }
 
-func (d *drySender) RangeLen() int {
-	return len(d.ranges)
+func (sender *drySender) RangeLen() int {
+	return len(sender.ranges)
 }
 
-func (d *drySender) BatchCount() int {
-	return d.nBatch
+func (sender *drySender) BatchCount() int {
+	return sender.nBatch
 }
 
-var (
-	_ = Suite(&testBatcherSuite{})
-)
+var _ = Suite(&testBatcherSuite{})
 
 func fakeTableWithRange(id int64, rngs []rtree.Range) restore.TableWithRange {
 	tbl := &utils.Table{
-		Db: &model.DBInfo{},
+		DB: &model.DBInfo{},
 		Info: &model.TableInfo{
 			ID: id,
 		},
@@ -250,7 +272,8 @@ func (*testBatcherSuite) TestSplitRangeOnSameTable(c *C) {
 		fakeRange("caa", "cab"), fakeRange("cac", "cad"),
 		fakeRange("cae", "caf"), fakeRange("cag", "cai"),
 		fakeRange("caj", "cak"), fakeRange("cal", "cam"),
-		fakeRange("can", "cao"), fakeRange("cap", "caq")})
+		fakeRange("can", "cao"), fakeRange("cap", "caq"),
+	})
 
 	batcher.Add(simpleTable)
 	batcher.Close()
@@ -269,10 +292,12 @@ func (*testBatcherSuite) TestRewriteRules(c *C) {
 	tableRanges := [][]rtree.Range{
 		{fakeRange("aaa", "aab")},
 		{fakeRange("baa", "bab"), fakeRange("bac", "bad")},
-		{fakeRange("caa", "cab"), fakeRange("cac", "cad"),
+		{
+			fakeRange("caa", "cab"), fakeRange("cac", "cad"),
 			fakeRange("cae", "caf"), fakeRange("cag", "cai"),
 			fakeRange("caj", "cak"), fakeRange("cal", "cam"),
-			fakeRange("can", "cao"), fakeRange("cap", "caq")},
+			fakeRange("can", "cao"), fakeRange("cap", "caq"),
+		},
 	}
 	rewriteRules := []*restore.RewriteRules{
 		fakeRewriteRules("a", "ada"),
@@ -329,13 +354,15 @@ func (*testBatcherSuite) TestBatcherLen(c *C) {
 		fakeRange("caa", "cab"), fakeRange("cac", "cad"),
 		fakeRange("cae", "caf"), fakeRange("cag", "cai"),
 		fakeRange("caj", "cak"), fakeRange("cal", "cam"),
-		fakeRange("can", "cao"), fakeRange("cap", "caq")})
+		fakeRange("can", "cao"), fakeRange("cap", "caq"),
+	})
 
 	simpleTable2 := fakeTableWithRange(2, []rtree.Range{
 		fakeRange("caa", "cab"), fakeRange("cac", "cad"),
 		fakeRange("cae", "caf"), fakeRange("cag", "cai"),
 		fakeRange("caj", "cak"), fakeRange("cal", "cam"),
-		fakeRange("can", "cao"), fakeRange("cap", "caq")})
+		fakeRange("can", "cao"), fakeRange("cap", "caq"),
+	})
 
 	batcher.Add(simpleTable)
 	waitForSend()

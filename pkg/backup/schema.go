@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/opentracing/opentracing-go"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/backup"
 	"github.com/pingcap/log"
@@ -60,8 +61,15 @@ func (pending *Schemas) Start(
 	store kv.Storage,
 	backupTS uint64,
 	concurrency uint,
+	copConcurrency uint,
 	updateCh glue.Progress,
 ) {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("Schemas.Start", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+		ctx = opentracing.ContextWithSpan(ctx, span1)
+	}
+
 	workerPool := utils.NewWorkerPool(concurrency, "Schemas")
 	errg, ectx := errgroup.WithContext(ctx)
 	go func() {
@@ -75,12 +83,12 @@ func (pending *Schemas) Start(
 				table := model.TableInfo{}
 				err := json.Unmarshal(schema.Table, &table)
 				if err != nil {
-					return err
+					return errors.Trace(err)
 				}
 				checksumResp, err := calculateChecksum(
-					ectx, &table, store.GetClient(), backupTS)
+					ectx, &table, store.GetClient(), backupTS, copConcurrency)
 				if err != nil {
-					return err
+					return errors.Trace(err)
 				}
 				schema.Crc64Xor = checksumResp.Checksum
 				schema.TotalKvs = checksumResp.TotalKvs
@@ -144,8 +152,11 @@ func calculateChecksum(
 	table *model.TableInfo,
 	client kv.Client,
 	backupTS uint64,
+	concurrency uint,
 ) (*tipb.ChecksumResponse, error) {
-	exe, err := checksum.NewExecutorBuilder(table, backupTS).Build()
+	exe, err := checksum.NewExecutorBuilder(table, backupTS).
+		SetConcurrency(concurrency).
+		Build()
 	if err != nil {
 		return nil, errors.Trace(err)
 	}

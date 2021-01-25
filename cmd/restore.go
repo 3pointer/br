@@ -3,14 +3,17 @@
 package cmd
 
 import (
+	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/session"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
+	"sourcegraph.com/sourcegraph/appdash"
 
 	"github.com/pingcap/br/pkg/gluetikv"
 	"github.com/pingcap/br/pkg/summary"
 	"github.com/pingcap/br/pkg/task"
+	"github.com/pingcap/br/pkg/trace"
 	"github.com/pingcap/br/pkg/utils"
 )
 
@@ -18,11 +21,38 @@ func runRestoreCommand(command *cobra.Command, cmdName string) error {
 	cfg := task.RestoreConfig{Config: task.Config{LogProgress: HasLogFile()}}
 	if err := cfg.ParseFromFlags(command.Flags()); err != nil {
 		command.SilenceUsage = false
-		return err
+		return errors.Trace(err)
+	}
+
+	ctx := GetDefaultContext()
+	if cfg.EnableOpenTracing {
+		var store *appdash.MemoryStore
+		ctx, store = trace.TracerStartSpan(ctx)
+		defer trace.TracerFinishSpan(ctx, store)
 	}
 	if err := task.RunRestore(GetDefaultContext(), tidbGlue, cmdName, &cfg); err != nil {
 		log.Error("failed to restore", zap.Error(err))
-		return err
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+func runLogRestoreCommand(command *cobra.Command) error {
+	cfg := task.LogRestoreConfig{Config: task.Config{LogProgress: HasLogFile()}}
+	if err := cfg.ParseFromFlags(command.Flags()); err != nil {
+		command.SilenceUsage = false
+		return errors.Trace(err)
+	}
+
+	ctx := GetDefaultContext()
+	if cfg.EnableOpenTracing {
+		var store *appdash.MemoryStore
+		ctx, store = trace.TracerStartSpan(ctx)
+		defer trace.TracerFinishSpan(ctx, store)
+	}
+	if err := task.RunLogRestore(GetDefaultContext(), tidbGlue, &cfg); err != nil {
+		log.Error("failed to restore", zap.Error(err))
+		return errors.Trace(err)
 	}
 	return nil
 }
@@ -33,25 +63,18 @@ func runRestoreRawCommand(command *cobra.Command, cmdName string) error {
 	}
 	if err := cfg.ParseFromFlags(command.Flags()); err != nil {
 		command.SilenceUsage = false
-		return err
+		return errors.Trace(err)
+	}
+
+	ctx := GetDefaultContext()
+	if cfg.EnableOpenTracing {
+		var store *appdash.MemoryStore
+		ctx, store = trace.TracerStartSpan(ctx)
+		defer trace.TracerFinishSpan(ctx, store)
 	}
 	if err := task.RunRestoreRaw(GetDefaultContext(), gluetikv.Glue{}, cmdName, &cfg); err != nil {
 		log.Error("failed to restore raw kv", zap.Error(err))
-		return err
-	}
-	return nil
-}
-
-func runRestoreTiflashReplicaCommand(command *cobra.Command, cmdName string) error {
-	cfg := task.RestoreConfig{Config: task.Config{LogProgress: HasLogFile()}}
-	if err := cfg.ParseFromFlags(command.Flags()); err != nil {
-		command.SilenceUsage = false
-		return err
-	}
-
-	if err := task.RunRestoreTiflashReplica(GetDefaultContext(), tidbGlue, cmdName, &cfg); err != nil {
-		log.Error("failed to restore tiflash replica", zap.Error(err))
-		return err
+		return errors.Trace(err)
 	}
 	return nil
 }
@@ -64,12 +87,10 @@ func NewRestoreCommand() *cobra.Command {
 		SilenceUsage: true,
 		PersistentPreRunE: func(c *cobra.Command, args []string) error {
 			if err := Init(c); err != nil {
-				return err
+				return errors.Trace(err)
 			}
 			utils.LogBRInfo()
 			task.LogArguments(c)
-
-			// Do not run stat worker in BR.
 			session.DisableStats4Test()
 
 			summary.SetUnit(summary.RestoreUnit)
@@ -78,10 +99,10 @@ func NewRestoreCommand() *cobra.Command {
 	}
 	command.AddCommand(
 		newFullRestoreCommand(),
-		newDbRestoreCommand(),
+		newDBRestoreCommand(),
 		newTableRestoreCommand(),
+		newLogRestoreCommand(),
 		newRawRestoreCommand(),
-		newTiflashReplicaRestoreCommand(),
 	)
 	task.DefineRestoreFlags(command.PersistentFlags())
 
@@ -92,6 +113,7 @@ func newFullRestoreCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use:   "full",
 		Short: "restore all tables",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runRestoreCommand(cmd, "Full restore")
 		},
@@ -100,10 +122,11 @@ func newFullRestoreCommand() *cobra.Command {
 	return command
 }
 
-func newDbRestoreCommand() *cobra.Command {
+func newDBRestoreCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use:   "db",
 		Short: "restore tables in a database",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runRestoreCommand(cmd, "Database restore")
 		},
@@ -116,6 +139,7 @@ func newTableRestoreCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use:   "table",
 		Short: "restore a table",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runRestoreCommand(cmd, "Table restore")
 		},
@@ -124,14 +148,17 @@ func newTableRestoreCommand() *cobra.Command {
 	return command
 }
 
-func newTiflashReplicaRestoreCommand() *cobra.Command {
+func newLogRestoreCommand() *cobra.Command {
 	command := &cobra.Command{
-		Use:   "tiflash-replica",
-		Short: "restore the tiflash replica before the last restore, it must only be used after the last restore failed",
+		Use:   "cdclog",
+		Short: "(experimental) restore data from cdc log backup",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runRestoreTiflashReplicaCommand(cmd, "Restore TiFlash Replica")
+			return runLogRestoreCommand(cmd)
 		},
 	}
+	task.DefineFilterFlags(command)
+	task.DefineLogRestoreFlags(command)
 	return command
 }
 
@@ -139,6 +166,7 @@ func newRawRestoreCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use:   "raw",
 		Short: "(experimental) restore a raw kv range to TiKV cluster",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runRestoreRawCommand(cmd, "Raw restore")
 		},

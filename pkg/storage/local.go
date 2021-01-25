@@ -3,13 +3,18 @@
 package storage
 
 import (
+	"bufio"
 	"context"
 	"io/ioutil"
 	"os"
-	"path"
 	"path/filepath"
 
 	"github.com/pingcap/errors"
+)
+
+const (
+	localDirPerm  os.FileMode = 0o755
+	localFilePerm os.FileMode = 0o644
 )
 
 // LocalStorage represents local file system storage.
@@ -19,21 +24,23 @@ type LocalStorage struct {
 	base string
 }
 
-func (l *LocalStorage) Write(ctx context.Context, name string, data []byte) error {
-	filepath := path.Join(l.base, name)
-	return ioutil.WriteFile(filepath, data, 0644) // nolint:gosec
-	// the backupmeta file _is_ intended to be world-readable.
+// WriteFile writes data to a file to storage.
+func (l *LocalStorage) WriteFile(ctx context.Context, name string, data []byte) error {
+	path := filepath.Join(l.base, name)
+	return ioutil.WriteFile(path, data, localFilePerm)
+	// the backup meta file _is_ intended to be world-readable.
 }
 
-func (l *LocalStorage) Read(ctx context.Context, name string) ([]byte, error) {
-	filepath := path.Join(l.base, name)
-	return ioutil.ReadFile(filepath)
+// ReadFile reads the file from the storage and returns the contents.
+func (l *LocalStorage) ReadFile(ctx context.Context, name string) ([]byte, error) {
+	path := filepath.Join(l.base, name)
+	return ioutil.ReadFile(path)
 }
 
 // FileExists implement ExternalStorage.FileExists.
 func (l *LocalStorage) FileExists(ctx context.Context, name string) (bool, error) {
-	filepath := path.Join(l.base, name)
-	return pathExists(filepath)
+	path := filepath.Join(l.base, name)
+	return pathExists(path)
 }
 
 // WalkDir traverse all the files in a dir.
@@ -42,8 +49,13 @@ func (l *LocalStorage) FileExists(ctx context.Context, name string) (bool, error
 // The first argument is the file path that can be used in `Open`
 // function; the second argument is the size in byte of the file determined
 // by path.
-func (l *LocalStorage) WalkDir(ctx context.Context, fn func(string, int64) error) error {
-	return filepath.Walk(l.base, func(path string, f os.FileInfo, err error) error {
+func (l *LocalStorage) WalkDir(ctx context.Context, opt *WalkOption, fn func(string, int64) error) error {
+	base := filepath.Join(l.base, opt.SubDir)
+	return filepath.Walk(base, func(path string, f os.FileInfo, err error) error {
+		if os.IsNotExist(err) {
+			// if path not exists, we should return nil to continue.
+			return nil
+		}
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -51,14 +63,41 @@ func (l *LocalStorage) WalkDir(ctx context.Context, fn func(string, int64) error
 		if f == nil || f.IsDir() {
 			return nil
 		}
+		// in mac osx, the path parameter is absolute path; in linux, the path is relative path to execution base dir,
+		// so use Rel to convert to relative path to l.base
+		path, _ = filepath.Rel(l.base, path)
 
-		return fn(f.Name(), f.Size())
+		size := f.Size()
+		// if not a regular file, we need to use os.stat to get the real file size
+		if !f.Mode().IsRegular() {
+			stat, err := os.Stat(filepath.Join(l.base, path))
+			if err != nil {
+				return errors.Trace(err)
+			}
+			size = stat.Size()
+		}
+		return fn(path, size)
 	})
 }
 
-// Open a Reader by file name.
-func (l *LocalStorage) Open(ctx context.Context, name string) (ReadSeekCloser, error) {
-	return os.Open(path.Join(l.base, name))
+// URI returns the base path as an URI with a file:/// prefix.
+func (l *LocalStorage) URI() string {
+	return "file:///" + l.base
+}
+
+// Open a Reader by file path, path is a relative path to base path.
+func (l *LocalStorage) Open(ctx context.Context, path string) (ExternalFileReader, error) {
+	return os.Open(filepath.Join(l.base, path))
+}
+
+// Create implements ExternalStorage interface.
+func (l *LocalStorage) Create(ctx context.Context, name string) (ExternalFileWriter, error) {
+	file, err := os.Create(filepath.Join(l.base, name))
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	buf := bufio.NewWriter(file)
+	return newFlushStorageWriter(buf, buf, file), nil
 }
 
 func pathExists(_path string) (bool, error) {
@@ -67,7 +106,7 @@ func pathExists(_path string) (bool, error) {
 		if os.IsNotExist(err) {
 			return false, nil
 		}
-		return false, err
+		return false, errors.Trace(err)
 	}
 	return true, nil
 }
@@ -78,12 +117,12 @@ func pathExists(_path string) (bool, error) {
 func NewLocalStorage(base string) (*LocalStorage, error) {
 	ok, err := pathExists(base)
 	if err != nil {
-		return nil, err
+		return nil, errors.Trace(err)
 	}
 	if !ok {
 		err := mkdirAll(base)
 		if err != nil {
-			return nil, err
+			return nil, errors.Trace(err)
 		}
 	}
 	return &LocalStorage{base: base}, nil

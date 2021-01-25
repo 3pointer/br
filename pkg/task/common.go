@@ -7,22 +7,27 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
+	gcs "cloud.google.com/go/storage"
 	"github.com/gogo/protobuf/proto"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/backup"
 	"github.com/pingcap/log"
-	pd "github.com/pingcap/pd/v4/client"
 	filter "github.com/pingcap/tidb-tools/pkg/table-filter"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	pd "github.com/tikv/pd/client"
 	"go.etcd.io/etcd/pkg/transport"
 	"go.uber.org/zap"
+	"google.golang.org/grpc/keepalive"
 
 	"github.com/pingcap/br/pkg/conn"
+	berrors "github.com/pingcap/br/pkg/errors"
 	"github.com/pingcap/br/pkg/glue"
 	"github.com/pingcap/br/pkg/storage"
 	"github.com/pingcap/br/pkg/utils"
@@ -45,17 +50,26 @@ const (
 	flagDatabase = "db"
 	flagTable    = "table"
 
-	flagRateLimit          = "ratelimit"
-	flagRateLimitUnit      = "ratelimit-unit"
-	flagConcurrency        = "concurrency"
-	flagChecksum           = "checksum"
-	flagFilter             = "filter"
-	flagCaseSensitive      = "case-sensitive"
-	flagRemoveTiFlash      = "remove-tiflash"
-	flagCheckRequirement   = "check-requirements"
-	flagSwitchModeInterval = "switch-mode-interval"
+	flagChecksumConcurrency = "checksum-concurrency"
+	flagRateLimit           = "ratelimit"
+	flagRateLimitUnit       = "ratelimit-unit"
+	flagConcurrency         = "concurrency"
+	flagChecksum            = "checksum"
+	flagFilter              = "filter"
+	flagCaseSensitive       = "case-sensitive"
+	flagRemoveTiFlash       = "remove-tiflash"
+	flagCheckRequirement    = "check-requirements"
+	flagSwitchModeInterval  = "switch-mode-interval"
+	// flagGrpcKeepaliveTime is the interval of pinging the server.
+	flagGrpcKeepaliveTime = "grpc-keepalive-time"
+	// flagGrpcKeepaliveTimeout is the max time a grpc conn can keep idel before killed.
+	flagGrpcKeepaliveTimeout = "grpc-keepalive-timeout"
+	// flagEnableOpenTracing is whether to enable opentracing
+	flagEnableOpenTracing = "enable-opentracing"
 
-	defaultSwitchInterval = 5 * time.Minute
+	defaultSwitchInterval       = 5 * time.Minute
+	defaultGRPCKeepaliveTime    = 10 * time.Second
+	defaultGRPCKeepaliveTimeout = 3 * time.Second
 )
 
 // TLSConfig is the common configuration for TLS connection.
@@ -88,13 +102,14 @@ func (tls *TLSConfig) ToTLSConfig() (*tls.Config, error) {
 type Config struct {
 	storage.BackendOptions
 
-	Storage     string    `json:"storage" toml:"storage"`
-	PD          []string  `json:"pd" toml:"pd"`
-	TLS         TLSConfig `json:"tls" toml:"tls"`
-	RateLimit   uint64    `json:"rate-limit" toml:"rate-limit"`
-	Concurrency uint32    `json:"concurrency" toml:"concurrency"`
-	Checksum    bool      `json:"checksum" toml:"checksum"`
-	SendCreds   bool      `json:"send-credentials-to-tikv" toml:"send-credentials-to-tikv"`
+	Storage             string    `json:"storage" toml:"storage"`
+	PD                  []string  `json:"pd" toml:"pd"`
+	TLS                 TLSConfig `json:"tls" toml:"tls"`
+	RateLimit           uint64    `json:"rate-limit" toml:"rate-limit"`
+	ChecksumConcurrency uint      `json:"checksum-concurrency" toml:"checksum-concurrency"`
+	Concurrency         uint32    `json:"concurrency" toml:"concurrency"`
+	Checksum            bool      `json:"checksum" toml:"checksum"`
+	SendCreds           bool      `json:"send-credentials-to-tikv" toml:"send-credentials-to-tikv"`
 	// LogProgress is true means the progress bar is printed to the log instead of stdout.
 	LogProgress bool `json:"log-progress" toml:"log-progress"`
 
@@ -109,10 +124,16 @@ type Config struct {
 	// should be removed after TiDB upgrades the BR dependency.
 	Filter filter.MySQLReplicationRules
 
-	TableFilter        filter.Filter `json:"-" toml:"-"`
-	RemoveTiFlash      bool          `json:"remove-tiflash" toml:"remove-tiflash"`
-	CheckRequirements  bool          `json:"check-requirements" toml:"check-requirements"`
+	TableFilter       filter.Filter `json:"-" toml:"-"`
+	CheckRequirements bool          `json:"check-requirements" toml:"check-requirements"`
+	// EnableOpenTracing is whether to enable opentracing
+	EnableOpenTracing  bool          `json:"enable-opentracing" toml:"enable-opentracing"`
 	SwitchModeInterval time.Duration `json:"switch-mode-interval" toml:"switch-mode-interval"`
+
+	// GrpcKeepaliveTime is the interval of pinging the server.
+	GRPCKeepaliveTime time.Duration `json:"grpc-keepalive-time" toml:"grpc-keepalive-time"`
+	// GrpcKeepaliveTimeout is the max time a grpc conn can keep idel before killed.
+	GRPCKeepaliveTimeout time.Duration `json:"grpc-keepalive-timeout" toml:"grpc-keepalive-timeout"`
 }
 
 // DefineCommonFlags defines the flags common to all BRIE commands.
@@ -123,6 +144,8 @@ func DefineCommonFlags(flags *pflag.FlagSet) {
 	flags.String(flagCA, "", "CA certificate path for TLS connection")
 	flags.String(flagCert, "", "Certificate path for TLS connection")
 	flags.String(flagKey, "", "Private key path for TLS connection")
+	flags.Uint(flagChecksumConcurrency, variable.DefChecksumTableConcurrency, "The concurrency of table checksumming")
+	_ = flags.MarkHidden(flagChecksumConcurrency)
 
 	flags.Uint64(flagRateLimit, 0, "The rate limit of the task, MB/s per node")
 	flags.Bool(flagChecksum, true, "Run checksum at end of task")
@@ -137,10 +160,21 @@ func DefineCommonFlags(flags *pflag.FlagSet) {
 
 	flags.Uint64(flagRateLimitUnit, utils.MB, "The unit of rate limit")
 	_ = flags.MarkHidden(flagRateLimitUnit)
+	_ = flags.MarkDeprecated(flagRemoveTiFlash,
+		"TiFlash is fully supported by BR now, removing TiFlash isn't needed any more. This flag would be ignored.")
 
 	flags.Bool(flagCheckRequirement, true,
 		"Whether start version check before execute command")
 	flags.Duration(flagSwitchModeInterval, defaultSwitchInterval, "maintain import mode on TiKV during restore")
+	flags.Duration(flagGrpcKeepaliveTime, defaultGRPCKeepaliveTime,
+		"the interval of pinging gRPC peer, must keep the same value with TiKV and PD")
+	flags.Duration(flagGrpcKeepaliveTimeout, defaultGRPCKeepaliveTimeout,
+		"the max time a gRPC connection can keep idle before killed, must keep the same value with TiKV and PD")
+	_ = flags.MarkHidden(flagGrpcKeepaliveTime)
+	_ = flags.MarkHidden(flagGrpcKeepaliveTimeout)
+
+	flags.Bool(flagEnableOpenTracing, false,
+		"Set whether to enable opentracing during the backup/restore process")
 
 	storage.DefineFlags(flags)
 }
@@ -183,6 +217,17 @@ func (tls *TLSConfig) ParseFromFlags(flags *pflag.FlagSet) error {
 	return nil
 }
 
+func (cfg *Config) normalizePDURLs() error {
+	for i := range cfg.PD {
+		var err error
+		cfg.PD[i], err = normalizePDURL(cfg.PD[i], cfg.TLS.IsEnabled())
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	return nil
+}
+
 // ParseFromFlags parses the config from the flag set.
 func (cfg *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 	var err error
@@ -194,18 +239,15 @@ func (cfg *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 	if err != nil {
 		return errors.Trace(err)
 	}
-	cfg.PD, err = flags.GetStringSlice(flagPD)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	if len(cfg.PD) == 0 {
-		return errors.New("must provide at least one PD server address")
-	}
 	cfg.Concurrency, err = flags.GetUint32(flagConcurrency)
 	if err != nil {
 		return errors.Trace(err)
 	}
 	cfg.Checksum, err = flags.GetBool(flagChecksum)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	cfg.ChecksumConcurrency, err = flags.GetUint(flagChecksumConcurrency)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -221,16 +263,11 @@ func (cfg *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 	}
 	cfg.RateLimit = rateLimit * rateLimitUnit
 
-	cfg.RemoveTiFlash, err = flags.GetBool(flagRemoveTiFlash)
-	if err != nil {
-		return errors.Trace(err)
-	}
-
 	var caseSensitive bool
 	if filterFlag := flags.Lookup(flagFilter); filterFlag != nil {
 		f, err := filter.Parse(filterFlag.Value.(pflag.SliceValue).GetSlice())
 		if err != nil {
-			return err
+			return errors.Trace(err)
 		}
 		cfg.TableFilter = f
 		caseSensitive, err = flags.GetBool(flagCaseSensitive)
@@ -240,12 +277,12 @@ func (cfg *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 	} else if dbFlag := flags.Lookup(flagDatabase); dbFlag != nil {
 		db := dbFlag.Value.String()
 		if len(db) == 0 {
-			return errors.New("empty database name is not allowed")
+			return errors.Annotate(berrors.ErrInvalidArgument, "empty database name is not allowed")
 		}
 		if tblFlag := flags.Lookup(flagTable); tblFlag != nil {
 			tbl := tblFlag.Value.String()
 			if len(tbl) == 0 {
-				return errors.New("empty table name is not allowed")
+				return errors.Annotate(berrors.ErrInvalidArgument, "empty table name is not allowed")
 			}
 			cfg.TableFilter = filter.NewTablesFilter(filter.Table{
 				Schema: db,
@@ -270,33 +307,52 @@ func (cfg *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 	if err != nil {
 		return errors.Trace(err)
 	}
+	cfg.GRPCKeepaliveTime, err = flags.GetDuration(flagGrpcKeepaliveTime)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	cfg.GRPCKeepaliveTimeout, err = flags.GetDuration(flagGrpcKeepaliveTimeout)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	cfg.EnableOpenTracing, err = flags.GetBool(flagEnableOpenTracing)
+	if err != nil {
+		return errors.Trace(err)
+	}
 
 	if cfg.SwitchModeInterval <= 0 {
-		return errors.Errorf("--switch-mode-interval must be positive, %s is not allowed", cfg.SwitchModeInterval)
+		return errors.Annotatef(berrors.ErrInvalidArgument, "--switch-mode-interval must be positive, %s is not allowed", cfg.SwitchModeInterval)
 	}
 
-	if err := cfg.BackendOptions.ParseFromFlags(flags); err != nil {
-		return err
+	if err = cfg.BackendOptions.ParseFromFlags(flags); err != nil {
+		return errors.Trace(err)
 	}
-	return cfg.TLS.ParseFromFlags(flags)
+	if err = cfg.TLS.ParseFromFlags(flags); err != nil {
+		return errors.Trace(err)
+	}
+	cfg.PD, err = flags.GetStringSlice(flagPD)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if len(cfg.PD) == 0 {
+		return errors.Annotate(berrors.ErrInvalidArgument, "must provide at least one PD server address")
+	}
+	return cfg.normalizePDURLs()
 }
 
-// newMgr creates a new mgr at the given PD address.
-func newMgr(
-	ctx context.Context,
-	g glue.Glue,
-	pds []string,
+// NewMgr creates a new mgr at the given PD address.
+func NewMgr(ctx context.Context,
+	g glue.Glue, pds []string,
 	tlsConfig TLSConfig,
-	storeBehavior conn.StoreBehavior,
-	checkRequirements bool,
-) (*conn.Mgr, error) {
+	keepalive keepalive.ClientParameters,
+	checkRequirements bool) (*conn.Mgr, error) {
 	var (
 		tlsConf *tls.Config
 		err     error
 	)
 	pdAddress := strings.Join(pds, ",")
 	if len(pdAddress) == 0 {
-		return nil, errors.New("pd address can not be empty")
+		return nil, errors.Annotate(berrors.ErrInvalidArgument, "pd address can not be empty")
 	}
 
 	securityOption := pd.SecurityOption{}
@@ -306,16 +362,21 @@ func newMgr(
 		securityOption.KeyPath = tlsConfig.Key
 		tlsConf, err = tlsConfig.ToTLSConfig()
 		if err != nil {
-			return nil, err
+			return nil, errors.Trace(err)
 		}
 	}
 
 	// Disable GC because TiDB enables GC already.
 	store, err := g.Open(fmt.Sprintf("tikv://%s?disableGC=true", pdAddress), securityOption)
 	if err != nil {
-		return nil, err
+		return nil, errors.Trace(err)
 	}
-	return conn.NewMgr(ctx, g, pdAddress, store.(tikv.Storage), tlsConf, securityOption, storeBehavior, checkRequirements)
+
+	// Is it necessary to remove `StoreBehavior`?
+	return conn.NewMgr(ctx, g,
+		pdAddress, store.(tikv.Storage),
+		tlsConf, securityOption, keepalive,
+		conn.SkipTiFlash, checkRequirements)
 }
 
 // GetStorage gets the storage backend from the config.
@@ -325,7 +386,7 @@ func GetStorage(
 ) (*backup.StorageBackend, storage.ExternalStorage, error) {
 	u, err := storage.ParseBackend(cfg.Storage, &cfg.BackendOptions)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Trace(err)
 	}
 	s, err := storage.Create(ctx, u, cfg.SendCreds)
 	if err != nil {
@@ -342,11 +403,30 @@ func ReadBackupMeta(
 ) (*backup.StorageBackend, storage.ExternalStorage, *backup.BackupMeta, error) {
 	u, s, err := GetStorage(ctx, cfg)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, errors.Trace(err)
 	}
-	metaData, err := s.Read(ctx, fileName)
+	metaData, err := s.ReadFile(ctx, fileName)
 	if err != nil {
-		return nil, nil, nil, errors.Annotate(err, "load backupmeta failed")
+		if gcsObjectNotFound(err) {
+			// change gcs://bucket/abc/def to gcs://bucket/abc and read defbackupmeta
+			oldPrefix := u.GetGcs().GetPrefix()
+			newPrefix, file := path.Split(oldPrefix)
+			newFileName := file + fileName
+			u.GetGcs().Prefix = newPrefix
+			s, err = storage.Create(ctx, u, cfg.SendCreds)
+			if err != nil {
+				return nil, nil, nil, errors.Trace(err)
+			}
+			log.Info("retry load metadata in gcs", zap.String("newPrefix", newPrefix), zap.String("newFileName", newFileName))
+			metaData, err = s.ReadFile(ctx, newFileName)
+			if err != nil {
+				return nil, nil, nil, errors.Trace(err)
+			}
+			// reset prefix for tikv download sst file correctly.
+			u.GetGcs().Prefix = oldPrefix
+		} else {
+			return nil, nil, nil, errors.Annotate(err, "load backupmeta failed")
+		}
 	}
 	backupMeta := &backup.BackupMeta{}
 	if err = proto.Unmarshal(metaData, backupMeta); err != nil {
@@ -372,11 +452,58 @@ func flagToZapField(f *pflag.Flag) zap.Field {
 
 // LogArguments prints origin command arguments.
 func LogArguments(cmd *cobra.Command) {
-	var fields []zap.Field
-	cmd.Flags().VisitAll(func(f *pflag.Flag) {
-		if f.Changed {
-			fields = append(fields, flagToZapField(f))
-		}
+	flags := cmd.Flags()
+	fields := make([]zap.Field, 1, flags.NFlag()+1)
+	fields[0] = zap.String("__command", cmd.CommandPath())
+	flags.Visit(func(f *pflag.Flag) {
+		fields = append(fields, flagToZapField(f))
 	})
 	log.Info("arguments", fields...)
+}
+
+// GetKeepalive get the keepalive info from the config.
+func GetKeepalive(cfg *Config) keepalive.ClientParameters {
+	return keepalive.ClientParameters{
+		Time:    cfg.GRPCKeepaliveTime,
+		Timeout: cfg.GRPCKeepaliveTimeout,
+	}
+}
+
+// adjust adjusts the abnormal config value in the current config.
+// useful when not starting BR from CLI (e.g. from BRIE in SQL).
+func (cfg *Config) adjust() {
+	if cfg.GRPCKeepaliveTime == 0 {
+		cfg.GRPCKeepaliveTime = defaultGRPCKeepaliveTime
+	}
+	if cfg.GRPCKeepaliveTimeout == 0 {
+		cfg.GRPCKeepaliveTimeout = defaultGRPCKeepaliveTimeout
+	}
+	if cfg.ChecksumConcurrency == 0 {
+		cfg.ChecksumConcurrency = variable.DefChecksumTableConcurrency
+	}
+}
+
+func normalizePDURL(pd string, useTLS bool) (string, error) {
+	if strings.HasPrefix(pd, "http://") {
+		if useTLS {
+			return "", errors.Annotate(berrors.ErrInvalidArgument, "pd url starts with http while TLS enabled")
+		}
+		return strings.TrimPrefix(pd, "http://"), nil
+	}
+	if strings.HasPrefix(pd, "https://") {
+		if !useTLS {
+			return "", errors.Annotate(berrors.ErrInvalidArgument, "pd url starts with https while TLS disabled")
+		}
+		return strings.TrimPrefix(pd, "https://"), nil
+	}
+	return pd, nil
+}
+
+// check whether it's a bug before #647, to solve case #1
+// If the storage is set as gcs://bucket/prefix,
+// the SSTs are written correctly to gcs://bucket/prefix/*.sst
+// but the backupmeta is written wrongly to gcs://bucket/prefixbackupmeta.
+// see details https://github.com/pingcap/br/issues/675#issuecomment-753780742
+func gcsObjectNotFound(err error) bool {
+	return errors.Cause(err) == gcs.ErrObjectNotExist // nolint:errorlint
 }

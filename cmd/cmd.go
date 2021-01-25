@@ -4,18 +4,21 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/pingcap/br/pkg/gluetidb"
+	brlogutil "github.com/pingcap/br/pkg/logutil"
 	"github.com/pingcap/br/pkg/summary"
 	"github.com/pingcap/br/pkg/task"
 	"github.com/pingcap/br/pkg/utils"
@@ -40,6 +43,10 @@ const (
 	FlagStatusAddr = "status-addr"
 	// FlagSlowLogFile is the name of slow-log-file flag.
 	FlagSlowLogFile = "slow-log-file"
+	// FlagRedactLog is whether to redact sensitive information in log, already deprecated by FlagRedactInfoLog
+	FlagRedactLog = "redact-log"
+	// FlagRedactInfoLog is whether to redact sensitive information in log.
+	FlagRedactInfoLog = "redact-info-log"
 
 	flagVersion      = "version"
 	flagVersionShort = "V"
@@ -61,6 +68,10 @@ func AddFlags(cmd *cobra.Command) {
 		"Set the log file path. If not set, logs will output to temp file")
 	cmd.PersistentFlags().String(FlagLogFormat, "text",
 		"Set the log format")
+	cmd.PersistentFlags().Bool(FlagRedactLog, false,
+		"Set whether to redact sensitive info in log, already deprecated by --redact-info-log")
+	cmd.PersistentFlags().Bool(FlagRedactInfoLog, false,
+		"Set whether to redact sensitive info in log")
 	cmd.PersistentFlags().String(FlagStatusAddr, "",
 		"Set the HTTP listening address for the status report service. Set to empty string to disable")
 	task.DefineCommonFlags(cmd.PersistentFlags())
@@ -68,9 +79,10 @@ func AddFlags(cmd *cobra.Command) {
 	cmd.PersistentFlags().StringP(FlagSlowLogFile, "", "",
 		"Set the slow log file path. If not set, discard slow logs")
 	_ = cmd.PersistentFlags().MarkHidden(FlagSlowLogFile)
+	_ = cmd.PersistentFlags().MarkHidden(FlagRedactLog)
 }
 
-// Init ...
+// Init initializes BR cli.
 func Init(cmd *cobra.Command) (err error) {
 	initOnce.Do(func() {
 		// Initialize the logger.
@@ -95,7 +107,8 @@ func Init(cmd *cobra.Command) (err error) {
 		if len(conf.File.Filename) != 0 {
 			atomic.StoreUint64(&hasLogFile, 1)
 			summary.InitCollector(true)
-			cmd.Printf("Detail BR log in %s\n", conf.File.Filename)
+			// cmd.PrintErr prints to stderr, but PrintErrf prints to stdout.
+			cmd.PrintErr(fmt.Sprintf("Detail BR log in %s \n", conf.File.Filename))
 		}
 		lg, p, e := log.InitLogger(conf)
 		if e != nil {
@@ -103,6 +116,18 @@ func Init(cmd *cobra.Command) (err error) {
 			return
 		}
 		log.ReplaceGlobals(lg, p)
+
+		redactLog, e := cmd.Flags().GetBool(FlagRedactLog)
+		if e != nil {
+			err = e
+			return
+		}
+		redactInfoLog, e := cmd.Flags().GetBool(FlagRedactInfoLog)
+		if e != nil {
+			err = e
+			return
+		}
+		brlogutil.InitRedact(redactLog || redactInfoLog)
 
 		slowLogFilename, e := cmd.Flags().GetString(FlagSlowLogFile)
 		if e != nil {
@@ -137,7 +162,7 @@ func Init(cmd *cobra.Command) (err error) {
 			utils.StartDynamicPProfListener()
 		}
 	})
-	return err
+	return errors.Trace(err)
 }
 
 // HasLogFile returns whether we set a log file.

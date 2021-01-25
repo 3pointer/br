@@ -21,6 +21,24 @@ var _ = Suite(&testRestoreUtilSuite{})
 type testRestoreUtilSuite struct {
 }
 
+func (s *testRestoreUtilSuite) TestParseQuoteName(c *C) {
+	schema, table := restore.ParseQuoteName("`a`.`b`")
+	c.Assert(schema, Equals, "a")
+	c.Assert(table, Equals, "b")
+
+	schema, table = restore.ParseQuoteName("`a``b`.``````")
+	c.Assert(schema, Equals, "a`b")
+	c.Assert(table, Equals, "``")
+
+	schema, table = restore.ParseQuoteName("`.`.`.`")
+	c.Assert(schema, Equals, ".")
+	c.Assert(table, Equals, ".")
+
+	schema, table = restore.ParseQuoteName("`.``.`.`.`")
+	c.Assert(schema, Equals, ".`.")
+	c.Assert(table, Equals, ".")
+}
+
 func (s *testRestoreUtilSuite) TestGetSSTMetaFromFile(c *C) {
 	file := &backup.File{
 		Name:     "file_write.sst",
@@ -42,22 +60,33 @@ func (s *testRestoreUtilSuite) TestGetSSTMetaFromFile(c *C) {
 
 func (s *testRestoreUtilSuite) TestMapTableToFiles(c *C) {
 	filesOfTable1 := []*backup.File{
-		{Name: "table1-1.sst",
+		{
+			Name:     "table1-1.sst",
 			StartKey: tablecodec.EncodeTablePrefix(1),
-			EndKey:   tablecodec.EncodeTablePrefix(1)},
-		{Name: "table1-2.sst",
+			EndKey:   tablecodec.EncodeTablePrefix(1),
+		},
+		{
+			Name:     "table1-2.sst",
 			StartKey: tablecodec.EncodeTablePrefix(1),
-			EndKey:   tablecodec.EncodeTablePrefix(1)},
-		{Name: "table1-3.sst",
+			EndKey:   tablecodec.EncodeTablePrefix(1),
+		},
+		{
+			Name:     "table1-3.sst",
 			StartKey: tablecodec.EncodeTablePrefix(1),
-			EndKey:   tablecodec.EncodeTablePrefix(1)}}
+			EndKey:   tablecodec.EncodeTablePrefix(1),
+		},
+	}
 	filesOfTable2 := []*backup.File{
-		{Name: "table2-1.sst",
+		{
+			Name:     "table2-1.sst",
 			StartKey: tablecodec.EncodeTablePrefix(2),
-			EndKey:   tablecodec.EncodeTablePrefix(2)},
-		{Name: "table2-2.sst",
+			EndKey:   tablecodec.EncodeTablePrefix(2),
+		},
+		{
+			Name:     "table2-2.sst",
 			StartKey: tablecodec.EncodeTablePrefix(2),
-			EndKey:   tablecodec.EncodeTablePrefix(2)},
+			EndKey:   tablecodec.EncodeTablePrefix(2),
+		},
 	}
 
 	result := restore.MapTableToFiles(append(filesOfTable2, filesOfTable1...))
@@ -66,7 +95,7 @@ func (s *testRestoreUtilSuite) TestMapTableToFiles(c *C) {
 	c.Assert(result[2], DeepEquals, filesOfTable2)
 }
 
-func (s *testRestoreUtilSuite) TestValidateFileRanges(c *C) {
+func (s *testRestoreUtilSuite) TestValidateFileRewriteRule(c *C) {
 	rules := &restore.RewriteRules{
 		Table: []*import_sstpb.RewriteRule{&import_sstpb.RewriteRule{
 			OldKeyPrefix: []byte(tablecodec.EncodeTablePrefix(1)),
@@ -75,34 +104,34 @@ func (s *testRestoreUtilSuite) TestValidateFileRanges(c *C) {
 	}
 
 	// Empty start/end key is not allowed.
-	_, err := restore.ValidateFileRanges(
-		[]*backup.File{&backup.File{
+	err := restore.ValidateFileRewriteRule(
+		&backup.File{
 			Name:     "file_write.sst",
 			StartKey: []byte(""),
 			EndKey:   []byte(""),
-		}},
+		},
 		rules,
 	)
 	c.Assert(err, ErrorMatches, ".*cannot find rewrite rule.*")
 
 	// Range is not overlap, no rule found.
-	_, err = restore.ValidateFileRanges(
-		[]*backup.File{{
+	err = restore.ValidateFileRewriteRule(
+		&backup.File{
 			Name:     "file_write.sst",
 			StartKey: tablecodec.EncodeTablePrefix(0),
 			EndKey:   tablecodec.EncodeTablePrefix(1),
-		}},
+		},
 		rules,
 	)
 	c.Assert(err, ErrorMatches, ".*cannot find rewrite rule.*")
 
 	// No rule for end key.
-	_, err = restore.ValidateFileRanges(
-		[]*backup.File{{
+	err = restore.ValidateFileRewriteRule(
+		&backup.File{
 			Name:     "file_write.sst",
 			StartKey: tablecodec.EncodeTablePrefix(1),
 			EndKey:   tablecodec.EncodeTablePrefix(2),
-		}},
+		},
 		rules,
 	)
 	c.Assert(err, ErrorMatches, ".*cannot find rewrite rule.*")
@@ -112,30 +141,30 @@ func (s *testRestoreUtilSuite) TestValidateFileRanges(c *C) {
 		OldKeyPrefix: tablecodec.EncodeTablePrefix(2),
 		NewKeyPrefix: tablecodec.EncodeTablePrefix(3),
 	})
-	_, err = restore.ValidateFileRanges(
-		[]*backup.File{{
+	err = restore.ValidateFileRewriteRule(
+		&backup.File{
 			Name:     "file_write.sst",
 			StartKey: tablecodec.EncodeTablePrefix(1),
 			EndKey:   tablecodec.EncodeTablePrefix(2),
-		}},
+		},
 		rules,
 	)
-	c.Assert(err, ErrorMatches, "table ids mismatch")
+	c.Assert(err, ErrorMatches, ".*restore table ID mismatch")
 
 	// Add a bad rule for end key, after rewrite start key > end key.
 	rules.Table = append(rules.Table[:1], &import_sstpb.RewriteRule{
 		OldKeyPrefix: tablecodec.EncodeTablePrefix(2),
 		NewKeyPrefix: tablecodec.EncodeTablePrefix(1),
 	})
-	_, err = restore.ValidateFileRanges(
-		[]*backup.File{{
+	err = restore.ValidateFileRewriteRule(
+		&backup.File{
 			Name:     "file_write.sst",
 			StartKey: tablecodec.EncodeTablePrefix(1),
 			EndKey:   tablecodec.EncodeTablePrefix(2),
-		}},
+		},
 		rules,
 	)
-	c.Assert(err, ErrorMatches, "unexpected rewrite rules")
+	c.Assert(err, ErrorMatches, ".*unexpected rewrite rules.*")
 }
 
 func (s *testRestoreUtilSuite) TestPaginateScanRegion(c *C) {
@@ -237,5 +266,5 @@ func (s *testRestoreUtilSuite) TestPaginateScanRegion(c *C) {
 	c.Assert(batch, DeepEquals, regions[1:2])
 
 	_, err = restore.PaginateScanRegion(ctx, newTestClient(stores, regionMap, 0), []byte{2}, []byte{1}, 3)
-	c.Assert(err, ErrorMatches, "startKey >= endKey.*")
+	c.Assert(err, ErrorMatches, ".*startKey >= endKey.*")
 }

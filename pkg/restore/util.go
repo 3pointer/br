@@ -5,14 +5,14 @@ package restore
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql" // mysql driver
 	"github.com/pingcap/errors"
-	"github.com/pingcap/kvproto/pkg/backup"
+	kvproto "github.com/pingcap/kvproto/pkg/backup"
 	"github.com/pingcap/kvproto/pkg/import_sstpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/log"
@@ -22,19 +22,22 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
+	berrors "github.com/pingcap/br/pkg/errors"
 	"github.com/pingcap/br/pkg/glue"
+	"github.com/pingcap/br/pkg/logutil"
 	"github.com/pingcap/br/pkg/rtree"
 	"github.com/pingcap/br/pkg/summary"
 	"github.com/pingcap/br/pkg/utils"
 )
 
-var recordPrefixSep = []byte("_r")
+var (
+	recordPrefixSep = []byte("_r")
+	quoteRegexp     = regexp.MustCompile("`(?:[^`]|``)*`")
+)
 
 // GetRewriteRules returns the rewrite rule of the new table and the old table.
 func GetRewriteRules(
-	newTable *model.TableInfo,
-	oldTable *model.TableInfo,
-	newTimeStamp uint64,
+	newTable, oldTable *model.TableInfo, newTimeStamp uint64,
 ) *RewriteRules {
 	tableIDs := make(map[int64]int64)
 	tableIDs[oldTable.ID] = newTable.ID
@@ -88,16 +91,16 @@ func GetRewriteRules(
 // The range of the returned sst meta is [regionRule.NewKeyPrefix, append(regionRule.NewKeyPrefix, 0xff)].
 func GetSSTMetaFromFile(
 	id []byte,
-	file *backup.File,
+	file *kvproto.File,
 	region *metapb.Region,
 	regionRule *import_sstpb.RewriteRule,
 ) import_sstpb.SSTMeta {
 	// Get the column family of the file by the file name.
 	var cfName string
-	if strings.Contains(file.GetName(), "default") {
-		cfName = "default"
-	} else if strings.Contains(file.GetName(), "write") {
-		cfName = "write"
+	if strings.Contains(file.GetName(), defaultCFName) {
+		cfName = defaultCFName
+	} else if strings.Contains(file.GetName(), writeCFName) {
+		cfName = writeCFName
 	}
 	// Find the overlapped part between the file and the region.
 	// Here we rewrites the keys to compare with the keys of the region.
@@ -119,15 +122,16 @@ func GetSSTMetaFromFile(
 	}
 
 	if bytes.Compare(rangeStart, rangeEnd) > 0 {
-		log.Fatal("range start exceed range end",
-			zap.Stringer("start", utils.WrapKey(rangeStart)),
-			zap.Stringer("end", utils.WrapKey(rangeEnd)))
+		log.Panic("range start exceed range end",
+			logutil.File(file),
+			zap.Stringer("rangeStart", logutil.WrapKey(rangeStart)),
+			zap.Stringer("rangeEnd", logutil.WrapKey(rangeEnd)))
 	}
 
 	log.Debug("get sstMeta",
-		utils.ZapFile(file),
-		zap.Stringer("rangeStart", utils.WrapKey(rangeStart)),
-		zap.Stringer("rangeEnd", utils.WrapKey(rangeEnd)))
+		logutil.File(file),
+		zap.Stringer("rangeStart", logutil.WrapKey(rangeStart)),
+		zap.Stringer("rangeEnd", logutil.WrapKey(rangeEnd)))
 
 	return import_sstpb.SSTMeta{
 		Uuid:   id,
@@ -156,7 +160,7 @@ func MakeDBPool(size uint, dbFactory func() (*DB, error)) ([]*DB, error) {
 }
 
 // EstimateRangeSize estimates the total range count by file.
-func EstimateRangeSize(files []*backup.File) int {
+func EstimateRangeSize(files []*kvproto.File) int {
 	result := 0
 	for _, f := range files {
 		if strings.HasSuffix(f.GetName(), "_write.sst") {
@@ -166,57 +170,37 @@ func EstimateRangeSize(files []*backup.File) int {
 	return result
 }
 
-// ValidateFileRanges checks and returns the ranges of the files.
-func ValidateFileRanges(
-	files []*backup.File,
-	rewriteRules *RewriteRules,
-) ([]rtree.Range, error) {
-	ranges := make([]rtree.Range, 0, len(files))
-	fileAppended := make(map[string]bool)
-
-	for _, file := range files {
-		// We skips all default cf files because we don't range overlap.
-		if !fileAppended[file.GetName()] && strings.Contains(file.GetName(), "write") {
-			rng, err := validateAndGetFileRange(file, rewriteRules)
-			if err != nil {
-				return nil, err
-			}
-			ranges = append(ranges, rng)
-			fileAppended[file.GetName()] = true
-		}
-	}
-	return ranges, nil
-}
-
 // MapTableToFiles makes a map that mapping table ID to its backup files.
 // aware that one file can and only can hold one table.
-func MapTableToFiles(files []*backup.File) map[int64][]*backup.File {
-	result := map[int64][]*backup.File{}
+func MapTableToFiles(files []*kvproto.File) map[int64][]*kvproto.File {
+	result := map[int64][]*kvproto.File{}
 	for _, file := range files {
 		tableID := tablecodec.DecodeTableID(file.GetStartKey())
 		tableEndID := tablecodec.DecodeTableID(file.GetEndKey())
 		if tableID != tableEndID {
 			log.Panic("key range spread between many files.",
 				zap.String("file name", file.Name),
-				zap.Stringer("start key", utils.WrapKey(file.GetStartKey())),
-				zap.Stringer("end key", utils.WrapKey(file.GetEndKey())))
+				zap.Stringer("start key", logutil.WrapKey(file.GetStartKey())),
+				zap.Stringer("end key", logutil.WrapKey(file.GetEndKey())))
 		}
 		if tableID == 0 {
 			log.Panic("invalid table key of file",
 				zap.String("file name", file.Name),
-				zap.Stringer("start key", utils.WrapKey(file.GetStartKey())),
-				zap.Stringer("end key", utils.WrapKey(file.GetEndKey())))
+				zap.Stringer("start key", logutil.WrapKey(file.GetStartKey())),
+				zap.Stringer("end key", logutil.WrapKey(file.GetEndKey())))
 		}
 		result[tableID] = append(result[tableID], file)
 	}
 	return result
 }
 
-// GoValidateFileRanges validate files by a stream of tables and yields tables with range.
+// GoValidateFileRanges validate files by a stream of tables and yields
+// tables with range.
 func GoValidateFileRanges(
 	ctx context.Context,
 	tableStream <-chan CreatedTable,
-	fileOfTable map[int64][]*backup.File,
+	fileOfTable map[int64][]*kvproto.File,
+	splitSizeBytes, splitKeyCount uint64,
 	errCh chan<- error,
 ) <-chan TableWithRange {
 	// Could we have a smaller outCh size?
@@ -236,7 +220,7 @@ func GoValidateFileRanges(
 				files := fileOfTable[t.OldTable.Info.ID]
 				if partitions := t.OldTable.Info.Partition; partitions != nil {
 					log.Debug("table partition",
-						zap.Stringer("database", t.OldTable.Db.Name),
+						zap.Stringer("database", t.OldTable.DB.Name),
 						zap.Stringer("table", t.Table.Name),
 						zap.Any("partition info", partitions),
 					)
@@ -244,14 +228,36 @@ func GoValidateFileRanges(
 						files = append(files, fileOfTable[partition.ID]...)
 					}
 				}
-				ranges, err := ValidateFileRanges(files, t.RewriteRule)
+				for _, file := range files {
+					err := ValidateFileRewriteRule(file, t.RewriteRule)
+					if err != nil {
+						errCh <- err
+						return
+					}
+				}
+				// Merge small ranges to reduce split and scatter regions.
+				ranges, stat, err := MergeFileRanges(
+					files, splitSizeBytes, splitKeyCount)
 				if err != nil {
 					errCh <- err
 					return
 				}
+				log.Info("merge and validate file",
+					zap.Stringer("database", t.OldTable.DB.Name),
+					zap.Stringer("table", t.Table.Name),
+					zap.Int("Files(total)", stat.TotalFiles),
+					zap.Int("File(write)", stat.TotalWriteCFFile),
+					zap.Int("File(default)", stat.TotalDefaultCFFile),
+					zap.Int("Region(total)", stat.TotalRegions),
+					zap.Int("Regoin(keys avg)", stat.RegionKeysAvg),
+					zap.Int("Region(bytes avg)", stat.RegionBytesAvg),
+					zap.Int("Merged(regions)", stat.MergedRegions),
+					zap.Int("Merged(keys avg)", stat.MergedRegionKeysAvg),
+					zap.Int("Merged(bytes avg)", stat.MergedRegionBytesAvg))
+
 				tableWithRange := TableWithRange{
 					CreatedTable: t,
-					Range:        AttachFilesToRanges(files, ranges),
+					Range:        ranges,
 				}
 				log.Debug("sending range info",
 					zap.Stringer("table", t.Table.Name),
@@ -265,59 +271,8 @@ func GoValidateFileRanges(
 	return outCh
 }
 
-// validateAndGetFileRange validates a file, if success, return the key range of this file.
-func validateAndGetFileRange(file *backup.File, rules *RewriteRules) (rtree.Range, error) {
-	err := ValidateFileRewriteRule(file, rules)
-	if err != nil {
-		return rtree.Range{}, err
-	}
-	startID := tablecodec.DecodeTableID(file.GetStartKey())
-	endID := tablecodec.DecodeTableID(file.GetEndKey())
-	if startID != endID {
-		log.Error("table ids mismatch",
-			zap.Int64("startID", startID),
-			zap.Int64("endID", endID),
-			utils.ZapFile(file))
-		return rtree.Range{}, errors.New("table ids mismatch")
-	}
-	r := rtree.Range{StartKey: file.GetStartKey(), EndKey: file.GetEndKey()}
-	return r, nil
-}
-
-// AttachFilesToRanges attach files to ranges.
-// Panic if range is overlapped or no range for files.
-func AttachFilesToRanges(
-	files []*backup.File,
-	ranges []rtree.Range,
-) []rtree.Range {
-	rangeTree := rtree.NewRangeTree()
-	for _, rg := range ranges {
-		rangeTree.Update(rg)
-	}
-	for _, f := range files {
-		rg := rangeTree.Find(&rtree.Range{
-			StartKey: f.GetStartKey(),
-			EndKey:   f.GetEndKey(),
-		})
-		if rg == nil {
-			log.Fatal("range not found",
-				zap.Stringer("startKey", utils.WrapKey(f.GetStartKey())),
-				zap.Stringer("endKey", utils.WrapKey(f.GetEndKey())))
-		}
-		file := *f
-		rg.Files = append(rg.Files, &file)
-	}
-	if rangeTree.Len() != len(ranges) {
-		log.Fatal("ranges overlapped",
-			zap.Int("ranges length", len(ranges)),
-			zap.Int("tree length", rangeTree.Len()))
-	}
-	sortedRanges := rangeTree.GetSortedRanges()
-	return sortedRanges
-}
-
 // ValidateFileRewriteRule uses rewrite rules to validate the ranges of a file.
-func ValidateFileRewriteRule(file *backup.File, rewriteRules *RewriteRules) error {
+func ValidateFileRewriteRule(file *kvproto.File, rewriteRules *RewriteRules) error {
 	// Check if the start key has a matched rewrite key
 	_, startRule := rewriteRawKey(file.GetStartKey(), rewriteRules)
 	if rewriteRules != nil && startRule == nil {
@@ -325,9 +280,9 @@ func ValidateFileRewriteRule(file *backup.File, rewriteRules *RewriteRules) erro
 		log.Error(
 			"cannot find rewrite rule for file start key",
 			zap.Int64("tableID", tableID),
-			utils.ZapFile(file),
+			logutil.File(file),
 		)
-		return errors.Errorf("cannot find rewrite rule")
+		return errors.Annotate(berrors.ErrRestoreInvalidRewrite, "cannot find rewrite rule")
 	}
 	// Check if the end key has a matched rewrite key
 	_, endRule := rewriteRawKey(file.GetEndKey(), rewriteRules)
@@ -336,9 +291,9 @@ func ValidateFileRewriteRule(file *backup.File, rewriteRules *RewriteRules) erro
 		log.Error(
 			"cannot find rewrite rule for file end key",
 			zap.Int64("tableID", tableID),
-			utils.ZapFile(file),
+			logutil.File(file),
 		)
-		return errors.Errorf("cannot find rewrite rule")
+		return errors.Annotate(berrors.ErrRestoreInvalidRewrite, "cannot find rewrite rule")
 	}
 	// the new prefix of the start rule must equal or less than the new prefix of the end rule
 	if bytes.Compare(startRule.GetNewKeyPrefix(), endRule.GetNewKeyPrefix()) > 0 {
@@ -350,9 +305,19 @@ func ValidateFileRewriteRule(file *backup.File, rewriteRules *RewriteRules) erro
 			zap.Int64("endTableID", endTableID),
 			zap.Stringer("startRule", startRule),
 			zap.Stringer("endRule", endRule),
-			utils.ZapFile(file),
+			logutil.File(file),
 		)
-		return errors.Errorf("unexpected rewrite rules")
+		return errors.Annotate(berrors.ErrRestoreInvalidRewrite, "unexpected rewrite rules")
+	}
+
+	startID := tablecodec.DecodeTableID(file.GetStartKey())
+	endID := tablecodec.DecodeTableID(file.GetEndKey())
+	if startID != endID {
+		log.Error("table ids mismatch",
+			zap.Int64("startID", startID),
+			zap.Int64("endID", endID),
+			logutil.File(file))
+		return errors.Annotate(berrors.ErrRestoreTableIDMismatch, "file start_key end_key table ids mismatch")
 	}
 	return nil
 }
@@ -429,7 +394,7 @@ func SplitRanges(
 	})
 }
 
-func rewriteFileKeys(file *backup.File, rewriteRules *RewriteRules) (startKey, endKey []byte, err error) {
+func rewriteFileKeys(file *kvproto.File, rewriteRules *RewriteRules) (startKey, endKey []byte, err error) {
 	startID := tablecodec.DecodeTableID(file.GetStartKey())
 	endID := tablecodec.DecodeTableID(file.GetEndKey())
 	var rule *import_sstpb.RewriteRule
@@ -437,24 +402,24 @@ func rewriteFileKeys(file *backup.File, rewriteRules *RewriteRules) (startKey, e
 		startKey, rule = rewriteRawKey(file.GetStartKey(), rewriteRules)
 		if rewriteRules != nil && rule == nil {
 			log.Error("cannot find rewrite rule",
-				zap.Stringer("startKey", utils.WrapKey(file.GetStartKey())),
+				zap.Stringer("startKey", logutil.WrapKey(file.GetStartKey())),
 				zap.Reflect("rewrite table", rewriteRules.Table),
 				zap.Reflect("rewrite data", rewriteRules.Data))
-			err = errors.New("cannot find rewrite rule for start key")
+			err = errors.Annotate(berrors.ErrRestoreInvalidRewrite, "cannot find rewrite rule for start key")
 			return
 		}
 		endKey, rule = rewriteRawKey(file.GetEndKey(), rewriteRules)
 		if rewriteRules != nil && rule == nil {
-			err = errors.New("cannot find rewrite rule for end key")
+			err = errors.Annotate(berrors.ErrRestoreInvalidRewrite, "cannot find rewrite rule for end key")
 			return
 		}
 	} else {
 		log.Error("table ids dont matched",
 			zap.Int64("startID", startID),
 			zap.Int64("endID", endID),
-			zap.Stringer("startKey", utils.WrapKey(startKey)),
-			zap.Stringer("endKey", utils.WrapKey(endKey)))
-		err = errors.New("illegal table id")
+			zap.Stringer("startKey", logutil.WrapKey(startKey)),
+			zap.Stringer("endKey", logutil.WrapKey(endKey)))
+		err = errors.Annotate(berrors.ErrRestoreInvalidRewrite, "invalid table id")
 	}
 	return
 }
@@ -473,8 +438,10 @@ func PaginateScanRegion(
 	ctx context.Context, client SplitClient, startKey, endKey []byte, limit int,
 ) ([]*RegionInfo, error) {
 	if len(endKey) != 0 && bytes.Compare(startKey, endKey) >= 0 {
-		return nil, errors.Errorf("startKey >= endKey, startKey %s, endkey %s",
-			hex.EncodeToString(startKey), hex.EncodeToString(endKey))
+		log.Error("restore range startKey >= endKey",
+			zap.Stringer("startKey", logutil.WrapKey(startKey)),
+			zap.Stringer("endKey", logutil.WrapKey(endKey)))
+		return nil, errors.Annotatef(berrors.ErrRestoreInvalidRange, "startKey >= endKey")
 	}
 
 	regions := []*RegionInfo{}
@@ -498,85 +465,62 @@ func PaginateScanRegion(
 	return regions, nil
 }
 
-func hasRejectStorePeer(
-	ctx context.Context,
-	client SplitClient,
-	regionID uint64,
-	rejectStores map[uint64]bool,
-) (bool, error) {
-	regionInfo, err := client.GetRegionByID(ctx, regionID)
-	if err != nil {
-		return false, err
-	}
-	if regionInfo == nil {
-		return false, nil
-	}
-	for _, peer := range regionInfo.Region.GetPeers() {
-		if rejectStores[peer.GetStoreId()] {
-			return true, nil
-		}
-	}
-	retryTimes := ctx.Value(retryTimes).(int)
-	if retryTimes > 10 {
-		log.Warn("get region info", utils.ZapRegion(regionInfo.Region))
-	}
-	return false, nil
-}
-
-func waitForRemoveRejectStores(
-	ctx context.Context,
-	client SplitClient,
-	regionInfo *RegionInfo,
-	rejectStores map[uint64]bool,
-) bool {
-	interval := RejectStoreCheckInterval
-	regionID := regionInfo.Region.GetId()
-	for i := 0; i < RejectStoreCheckRetryTimes; i++ {
-		ctx1 := context.WithValue(ctx, retryTimes, i)
-		ok, err := hasRejectStorePeer(ctx1, client, regionID, rejectStores)
-		if err != nil {
-			log.Warn("wait for rejecting store failed",
-				utils.ZapRegion(regionInfo.Region),
-				zap.Error(err))
-			return false
-		}
-		// Do not have any peer in the rejected store, return true
-		if !ok {
-			return true
-		}
-		interval = 2 * interval
-		if interval > RejectStoreMaxCheckInterval {
-			interval = RejectStoreMaxCheckInterval
-		}
-		time.Sleep(interval)
-	}
-
-	return false
-}
-
 // ZapTables make zap field of table for debuging, including table names.
 func ZapTables(tables []CreatedTable) zapcore.Field {
-	tableNames := make([]string, 0, len(tables))
-	for _, t := range tables {
-		tableNames = append(tableNames, fmt.Sprintf("%s.%s", t.OldTable.Db.Name, t.OldTable.Info.Name))
-	}
-	return zap.Strings("tables", tableNames)
+	return zap.Array("tables", tableSliceArrayMixIn(tables))
 }
 
 // ZapRanges make zap fields for debuging, which contains kv, size and count of ranges.
-func ZapRanges(ranges []rtree.Range) []zapcore.Field {
+// TODO make it a lazy zap object.
+func ZapRanges(ranges []rtree.Range) zapcore.Field {
+	return zap.Object("rangeInfo", rangesSliceObjectMixin(ranges))
+}
+
+type tableSliceArrayMixIn []CreatedTable
+
+func (ss tableSliceArrayMixIn) MarshalLogArray(encoder zapcore.ArrayEncoder) error {
+	for _, s := range ss {
+		encoder.AppendString(fmt.Sprintf("%s.%s",
+			utils.EncloseName(s.OldTable.DB.Name.String()),
+			utils.EncloseName(s.OldTable.Info.Name.String())))
+	}
+	return nil
+}
+
+type rangesSliceObjectMixin []rtree.Range
+
+func (rs rangesSliceObjectMixin) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 	totalKV := uint64(0)
 	totalSize := uint64(0)
-	for _, r := range ranges {
+	for _, r := range rs {
 		for _, f := range r.Files {
 			totalKV += f.GetTotalKvs()
 			totalSize += f.GetTotalBytes()
 		}
 	}
 
-	return []zap.Field{
-		zap.Int("ranges", len(ranges)),
-		zap.Uint64("total kv", totalKV),
-		zap.Uint64("total size", totalSize),
+	encoder.AddInt("ranges", len(rs))
+	encoder.AddUint64("total kv", totalKV)
+	encoder.AddUint64("total size", totalSize)
+	return nil
+}
+
+// ParseQuoteName parse the quote `db`.`table` name, and split it.
+func ParseQuoteName(name string) (db, table string) {
+	names := quoteRegexp.FindAllStringSubmatch(name, -1)
+	if len(names) != 2 {
+		log.Panic("failed to parse schema name",
+			zap.String("origin name", name),
+			zap.Any("parsed names", names))
 	}
+	db = names[0][0]
+	table = names[1][0]
+	db = strings.ReplaceAll(unQuoteName(db), "``", "`")
+	table = strings.ReplaceAll(unQuoteName(table), "``", "`")
+	return db, table
+}
+
+func unQuoteName(name string) string {
+	name = strings.TrimPrefix(name, "`")
+	return strings.TrimSuffix(name, "`")
 }

@@ -5,11 +5,11 @@ package gluetikv
 import (
 	"context"
 
-	pd "github.com/pingcap/pd/v4/client"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/store/tikv"
+	pd "github.com/tikv/pd/client"
 
 	"github.com/pingcap/br/pkg/glue"
 	"github.com/pingcap/br/pkg/summary"
@@ -48,24 +48,10 @@ func (Glue) OwnsStorage() bool {
 
 // StartProgress implements glue.Glue.
 func (Glue) StartProgress(ctx context.Context, cmdName string, total int64, redirectLog bool) glue.Progress {
-	return progress{ch: utils.StartProgress(ctx, cmdName, total, redirectLog)}
+	return utils.StartProgress(ctx, cmdName, total, redirectLog, nil)
 }
 
 // Record implements glue.Glue.
 func (Glue) Record(name string, val uint64) {
 	summary.CollectUint(name, val)
-}
-
-type progress struct {
-	ch chan<- struct{}
-}
-
-// Inc implements glue.Progress.
-func (p progress) Inc() {
-	p.ch <- struct{}{}
-}
-
-// Close implements glue.Progress.
-func (p progress) Close() {
-	close(p.ch)
 }
